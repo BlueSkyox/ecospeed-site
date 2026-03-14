@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const DEFAULT_ORS_API_KEY =
-  "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjA5MDkyNTdkYTlmNzQ5NmNhNjMxNzVjZGM1NTE0ZWYzIiwiaCI6Im11cm11cjY0In0=";
-
 function orsKey() {
-  return process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY || DEFAULT_ORS_API_KEY;
+  const key = process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY;
+  if (!key) {
+    throw new Error("Missing OPENROUTESERVICE_API_KEY or ORS_API_KEY");
+  }
+  return key;
 }
 
 export async function GET(req: NextRequest) {

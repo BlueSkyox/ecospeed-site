@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useState } from "react";
 
 type TestHistoryItem = {
   id: string;
@@ -27,6 +27,11 @@ type RouteApiResponse = {
   toll_cost_eur: number;
   weather_avg_temp_c: number;
   weather_avg_rain_mmh: number;
+  weather_avg_wind_kmh?: number;
+  weather_avg_headwind_ms?: number;
+  elevation_gain_m?: number;
+  elevation_loss_m?: number;
+  max_grade_pct?: number;
   weather_impact_eco_kwh: number;
   weather_impact_eco_eur: number;
   optimized_stop_count_eco: number;
@@ -53,6 +58,16 @@ function saveHistory(items: TestHistoryItem[]) {
   window.localStorage.setItem(HISTORY_KEY, JSON.stringify(items.slice(0, 100)));
 }
 
+function validateInputs(start: string, end: string, batteryStart: number, batteryEnd: number): string | null {
+  if (!start.trim() || !end.trim()) return "Merci de renseigner un depart et une arrivee.";
+  if (start.trim().toLowerCase() === end.trim().toLowerCase()) return "Le point de depart et d'arrivee doivent etre differents.";
+  if (!Number.isFinite(batteryStart) || !Number.isFinite(batteryEnd)) return "Les niveaux de batterie doivent etre valides.";
+  if (batteryStart < 5 || batteryStart > 100) return "Batterie depart: valeur attendue entre 5 et 100%.";
+  if (batteryEnd < 0 || batteryEnd > 90) return "Batterie arrivee: valeur attendue entre 0 et 90%.";
+  if (batteryStart <= batteryEnd) return "La batterie de depart doit etre superieure a la batterie d'arrivee.";
+  return null;
+}
+
 export default function TestDriveTab() {
   const [open, setOpen] = useState(false);
   const [start, setStart] = useState("Paris");
@@ -62,16 +77,19 @@ export default function TestDriveTab() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState<RouteApiResponse | null>(null);
-  const [history, setHistory] = useState<TestHistoryItem[]>([]);
-
-  useEffect(() => {
-    setHistory(loadHistory());
-  }, []);
-
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
+    const validationError = validateInputs(start, end, batteryStart, batteryEnd);
+    if (validationError) {
+      setError(validationError);
+      setResult(null);
+      return;
+    }
+
     setLoading(true);
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 25000);
     try {
       const payload = {
         start,
@@ -91,6 +109,7 @@ export default function TestDriveTab() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
       const data = (await r.json()) as RouteApiResponse & { detail?: string };
       if (!r.ok) throw new Error(data.detail || "Erreur de calcul");
@@ -111,14 +130,18 @@ export default function TestDriveTab() {
           avgTempC: Number(data.weather_avg_temp_c ?? 20),
           avgRainMmH: Number(data.weather_avg_rain_mmh ?? 0),
         };
-        const next = [item, ...history];
-        setHistory(next);
+        const next = [item, ...loadHistory()];
         saveHistory(next);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Erreur");
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setError("Le calcul prend trop de temps. Verifie ta connexion puis relance le test.");
+      } else {
+        setError(err instanceof Error ? err.message : "Erreur");
+      }
       setResult(null);
     } finally {
+      window.clearTimeout(timeoutId);
       setLoading(false);
     }
   };
@@ -153,6 +176,8 @@ export default function TestDriveTab() {
               <div className="test-weather-box">
                 <strong>Meteo et impact</strong>
                 <p>Temp moyenne: {result.weather_avg_temp_c.toFixed(1)} C | Pluie moyenne: {result.weather_avg_rain_mmh.toFixed(2)} mm/h</p>
+                <p>Vent moyen: {Number(result.weather_avg_wind_kmh ?? 0).toFixed(1)} km/h | Vent frontal moyen: {Number(result.weather_avg_headwind_ms ?? 0).toFixed(2)} m/s</p>
+                <p>Denivele: +{Number(result.elevation_gain_m ?? 0).toFixed(0)} m / -{Number(result.elevation_loss_m ?? 0).toFixed(0)} m | Pente max: {Number(result.max_grade_pct ?? 0).toFixed(1)}%</p>
                 <p>Impact meteo sur conso eco: +{result.weather_impact_eco_kwh.toFixed(2)} kWh (+{result.weather_impact_eco_eur.toFixed(2)} EUR)</p>
               </div>
             </div>

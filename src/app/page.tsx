@@ -1,30 +1,128 @@
 "use client";
 
-import Script from "next/script";
-import TestDriveTab from "@/components/TestDriveTab";
-import NewTripInsightsBridge from "@/components/NewTripInsightsBridge";
+import { useState } from "react";
+import LaunchControlPanel from "@/components/LaunchControlPanel";
+
+type Locale = "fr" | "en";
+
+const LOCALE_KEY = "ecospeed_locale_v1";
+
+const copy = {
+  fr: {
+    eyebrow: "EcoSpeed / planificateur VE",
+    title: "Des trajets electriques clairs, utiles et faciles a suivre.",
+    intro:
+      "Calculez une vitesse eco realiste, comprenez vos gains tout de suite et gardez une lecture simple du trajet avant et pendant la route.",
+    proofPoints: [
+      "Economies d energie et de CO2 faciles a lire",
+      "Segments avec vitesse optimale sur chaque portion",
+      "Plan de charge et carte dans une seule vue",
+    ],
+    pillars: [
+      {
+        title: "Lecture immediate",
+        text: "Les chiffres importants sont traduits en gains concrets: energie, argent, autonomie et CO2.",
+      },
+      {
+        title: "Aide a la conduite",
+        text: "Les informations critiques restent grosses, directes et faciles a retrouver sans surcharge visuelle.",
+      },
+      {
+        title: "Suivi motivant",
+        text: "Les badges et l historique encouragent l utilisateur a revenir et a mesurer ses progres.",
+      },
+    ],
+  },
+  en: {
+    eyebrow: "EcoSpeed / EV trip planner",
+    title: "Clear electric trips that are easy to understand and easy to follow.",
+    intro:
+      "Calculate a realistic eco speed, understand your savings instantly, and keep a simple trip view before and during the drive.",
+    proofPoints: [
+      "Energy and CO2 savings explained clearly",
+      "Segment-by-segment optimal speed guidance",
+      "Charging plan and map in one place",
+    ],
+    pillars: [
+      {
+        title: "Instant reading",
+        text: "The key numbers are translated into concrete gains: energy, money, range and CO2.",
+      },
+      {
+        title: "Driving support",
+        text: "Critical information stays large, direct and easy to find without visual overload.",
+      },
+      {
+        title: "Motivating follow-up",
+        text: "Badges and trip history encourage users to come back and track their progress.",
+      },
+    ],
+  },
+} as const;
 
 export default function Home() {
+  const [locale, setLocale] = useState<Locale>(() => {
+    if (typeof window === "undefined") return "fr";
+    try {
+      const stored = window.localStorage.getItem(LOCALE_KEY);
+      return stored === "fr" || stored === "en" ? stored : "fr";
+    } catch {
+      return "fr";
+    }
+  });
+
+  const setNextLocale = (nextLocale: Locale) => {
+    setLocale(nextLocale);
+    try {
+      window.localStorage.setItem(LOCALE_KEY, nextLocale);
+    } catch {}
+  };
+
+  const t = copy[locale];
+
   return (
-    <>
-      <noscript>You need to enable JavaScript to run this app.</noscript>
-      <div id="root" />
-      <NewTripInsightsBridge />
-      <TestDriveTab />
+    <main className="ecospeed-shell">
+      <section className="ecospeed-hero">
+        <div className="ecospeed-hero__copy">
+          <div className="ecospeed-hero__topbar">
+            <span className="ecospeed-eyebrow">{t.eyebrow}</span>
+            <div className="ecospeed-locale-switch" aria-label="Language switch">
+              <button
+                type="button"
+                className={locale === "fr" ? "is-active" : ""}
+                onClick={() => setNextLocale("fr")}
+              >
+                FR
+              </button>
+              <button
+                type="button"
+                className={locale === "en" ? "is-active" : ""}
+                onClick={() => setNextLocale("en")}
+              >
+                EN
+              </button>
+            </div>
+          </div>
+          <h1>{t.title}</h1>
+          <p>{t.intro}</p>
+          <div className="ecospeed-proof-strip">
+            {t.proofPoints.map((item) => (
+              <span key={item}>{item}</span>
+            ))}
+          </div>
+        </div>
+      </section>
 
-      <Script id="ecospeed-remove-badge" strategy="afterInteractive">
-        {`!function(){function e(){const e=document.getElementById("emergent-badge");e&&e.remove();document.querySelectorAll('a[href*="emergent"], a[href*="emergentagent"]').forEach(e=>{e.textContent&&e.textContent.toLowerCase().includes("made with emergent")&&e.remove()})}e(),"loading"===document.readyState&&document.addEventListener("DOMContentLoaded",e),setInterval(e,1e3)}();`}
-      </Script>
+      <section className="ecospeed-pillars">
+        {t.pillars.map((pillar) => (
+          <article key={pillar.title} className="ecospeed-pillar">
+            <h2>{pillar.title}</h2>
+            <p>{pillar.text}</p>
+          </article>
+        ))}
+      </section>
 
-      <Script id="ecospeed-posthog" strategy="afterInteractive">
-        {`!function(e,t){var r,s,o,i;t.__SV||(window.posthog=t,t._i=[],t.init=function(n,a,p){function c(e,t){var r=t.split(".");2==r.length&&(e=e[r[0]],t=r[1]),e[t]=function(){e.push([t].concat(Array.prototype.slice.call(arguments,0)))}}(o=e.createElement("script")).type="text/javascript",o.crossOrigin="anonymous",o.async=!0,o.src=a.api_host.replace(".i.posthog.com","-assets.i.posthog.com")+"/static/array.js",(i=e.getElementsByTagName("script")[0]).parentNode.insertBefore(o,i);var g=t;for(void 0!==p?g=t[p]=[]:p="posthog",g.people=g.people||[],g.toString=function(e){var t="posthog";return"posthog"!==p&&(t+="."+p),e||(t+=" (stub)"),t},g.people.toString=function(){return g.toString(1)+".people (stub)"},r="init me ws ys ps bs capture je Di ks register register_once register_for_session unregister unregister_for_session Ps getFeatureFlag getFeatureFlagPayload isFeatureEnabled reloadFeatureFlags updateEarlyAccessFeatureEnrollment getEarlyAccessFeatures on onFeatureFlags onSurveysLoaded onSessionId getSurveys getActiveMatchingSurveys renderSurvey canRenderSurvey canRenderSurveyAsync identify setPersonProperties group resetGroups setPersonPropertiesForFlags resetPersonPropertiesForFlags setGroupPropertiesForFlags resetGroupPropertiesForFlags reset get_distinct_id getGroups get_session_id get_session_replay_url alias set_config startSessionRecording stopSessionRecording sessionRecordingStarted captureException loadToolbar get_property getSessionProperty Es $s createPersonProfile Is opt_in_capturing opt_out_capturing has_opted_in_capturing has_opted_out_capturing clear_opt_in_out_capturing Ss debug xs getPageViewId captureTraceFeedback captureTraceMetric".split(" "),s=0;s<r.length;s++)c(g,r[s]);t._i.push([n,a,p])},t.__SV=1)}(document,window.posthog||[]),posthog.init("phc_yJW1VjHGGwmCbbrtczfqqNxgBDbhlhOWcdzcIJEOTFE",{api_host:"https://us.i.posthog.com",person_profiles:"identified_only"});`}
-      </Script>
-
-      <Script id="ecospeed-clear-sw-cache" strategy="afterInteractive">
-        {`(async function(){try{if('serviceWorker' in navigator){const regs=await navigator.serviceWorker.getRegistrations();await Promise.all(regs.map(r=>r.unregister()));}if('caches' in window){const keys=await caches.keys();await Promise.all(keys.map(k=>caches.delete(k)));}}catch(e){console.warn('Cache cleanup skipped',e);}})();`}
-      </Script>
-
-      <Script src="/static/js/main.274975f3.js?v=7" strategy="afterInteractive" />
-    </>
+      <LaunchControlPanel locale={locale} />
+    </main>
   );
 }

@@ -1,6 +1,6 @@
 type TripSession = {
   tripId: string;
-  status: "paused" | "active";
+  status: "planned" | "in_progress" | "paused" | "completed" | "abandoned" | "active";
   pausedAt: string;
   segmentIndex?: number;
   batteryPctBefore?: number;
@@ -8,6 +8,20 @@ type TripSession = {
   didRecharge?: boolean;
   notes?: string;
   remainingCoords?: [number, number][];
+  remainingEcoSpeedsKmh?: number[];
+  comfortTempC?: number;
+  vehicleProfile?: {
+    empty_mass?: number;
+    extra_load?: number;
+    drag_coefficient?: number;
+    frontal_area?: number;
+    rolling_resistance?: number;
+    motor_efficiency?: number;
+    regen_efficiency?: number;
+    aux_power_kw?: number;
+    battery_kwh?: number;
+    max_charge_kw?: number;
+  };
   distanceKm?: number;
   logbook?: Array<{
     id_segment: number;
@@ -35,7 +49,7 @@ export function markTripActive(tripId: string, batteryPctAfter?: number) {
   if (!cur) return null;
   const next: TripSession = {
     ...cur,
-    status: "active",
+    status: "in_progress",
     batteryPctAfter: batteryPctAfter ?? cur.batteryPctAfter ?? cur.batteryPctBefore,
   };
   store.set(tripId, next);

@@ -23,6 +23,8 @@ export type VehicleParams = {
   regenEff: number;
   auxPowerKw: number;
   batteryKwh: number;
+  windHeadMs?: number;
+  regenMaxKw?: number;
 };
 
 export type TripResult = {
@@ -53,8 +55,15 @@ export function haversineM(lon1: number, lat1: number, lon2: number, lat2: numbe
 export function rainDensityToCrrMultiplier(rainMmH: number): number {
   const r = Math.max(rainMmH, 0);
   if (r <= 0.05) return 1;
-  if (r <= 10) return 1.15;
+  if (r <= 1) return 1 + 0.08 * r;
+  if (r <= 10) return 1.08 + 0.07 * ((r - 1) / 9);
   return 1.2;
+}
+
+export function rollingResistanceTempMultiplier(tempC: number): number {
+  if (tempC >= 20) return 1;
+  if (tempC <= -15) return 1.22;
+  return 1 + (20 - tempC) * 0.0063;
 }
 
 export function calculateChargingStops(
@@ -73,6 +82,56 @@ export function calculateChargingStops(
   return { numStops: Math.max(0, Math.ceil((energyNeededKwh - available) / usableLeg)) };
 }
 
+export function estimateChargingMinutesFromEnergy(
+  currentEnergyKwh: number,
+  targetEnergyKwh: number,
+  batteryKwh: number,
+  vehicleMaxChargeKw: number,
+  stationPowerKw: number,
+): number {
+  const usablePowerKw = Math.max(20, Math.min(vehicleMaxChargeKw, stationPowerKw || 50));
+  const current = Math.max(0, currentEnergyKwh);
+  const target = Math.max(current, targetEnergyKwh);
+  const soc80 = batteryKwh * 0.8;
+  const soc95 = batteryKwh * 0.95;
+
+  let minutes = 0;
+  const fastEnd = Math.min(target, soc80);
+  if (fastEnd > current) {
+    minutes += ((fastEnd - current) / usablePowerKw) * 60;
+  }
+
+  const taperStart = Math.max(current, soc80);
+  const taperEnd = Math.min(target, soc95);
+  if (taperEnd > taperStart) {
+    minutes += ((taperEnd - taperStart) / Math.max(15, usablePowerKw * 0.55)) * 60;
+  }
+
+  if (target > soc95) {
+    minutes += ((target - soc95) / Math.max(8, usablePowerKw * 0.25)) * 60;
+  }
+
+  return minutes;
+}
+
+export function estimateChargingMinutesFromSoc(
+  currentPct: number,
+  targetPct: number,
+  batteryKwh: number,
+  vehicleMaxChargeKw: number,
+  stationPowerKw: number,
+): number {
+  const currentEnergyKwh = batteryKwh * (Math.max(0, Math.min(currentPct, 100)) / 100);
+  const targetEnergyKwh = batteryKwh * (Math.max(0, Math.min(targetPct, 95)) / 100);
+  return estimateChargingMinutesFromEnergy(
+    currentEnergyKwh,
+    targetEnergyKwh,
+    batteryKwh,
+    vehicleMaxChargeKw,
+    stationPowerKw,
+  );
+}
+
 export function segEnergyAndTime(
   distanceM: number,
   slope: number,
@@ -80,21 +139,27 @@ export function segEnergyAndTime(
   v: VehicleParams,
 ): { energyWh: number; timeH: number } {
   if (distanceM <= 0 || speedKmh <= 0) return { energyWh: 0, timeH: 0 };
-  const safeSlope = Math.max(-0.5, Math.min(0.5, slope));
+  const safeSlope = Math.max(-0.2, Math.min(0.2, slope));
   const speedMs = Math.max(speedKmh, 1e-3) * (1000 / 3600);
-  const fAero = 0.5 * v.rhoAir * v.cda * speedMs * speedMs;
+  const windHeadMs = Number.isFinite(v.windHeadMs) ? Number(v.windHeadMs) : 0;
+  const airSpeedMs = Math.max(0.1, speedMs + windHeadMs);
+  const fAero = 0.5 * v.rhoAir * v.cda * airSpeedMs * airSpeedMs;
   const fRoll = v.crr * v.massKg * G * Math.cos(Math.atan(safeSlope));
   const fGrade = v.massKg * G * safeSlope;
   const fTot = fAero + fRoll + fGrade;
   const timeH = distanceM / speedMs / 3600;
   const mechWh = (fTot * distanceM) / 3600;
   const auxWh = v.auxPowerKw * 1000 * timeH;
+  const regenMaxKw = Math.max(20, Number(v.regenMaxKw ?? 70));
+  const regenCapWh = regenMaxKw * 1000 * timeH;
+  const regenSpeedFactor = Math.max(0, Math.min(1, (speedKmh - 10) / 25));
 
   let elecWh = 0;
   if (mechWh >= 0) {
     elecWh = mechWh / Math.max(v.etaDrive, 1e-3) + auxWh;
   } else {
-    elecWh = mechWh * Math.max(v.regenEff, 0) + auxWh;
+    const recoveredWh = Math.min(Math.abs(mechWh) * Math.max(v.regenEff, 0), regenCapWh * regenSpeedFactor);
+    elecWh = auxWh - recoveredWh;
   }
   return { energyWh: elecWh, timeH };
 }
@@ -135,9 +200,13 @@ export function routeEnergyTime(
 }
 
 export function hvacPowerFromTemp(tempC: number, comfortC = 20): number {
-  const k = 0.18;
   const delta = Math.abs(tempC - comfortC);
-  return k * delta;
+  const baseVentilationKw = 0.3;
+  if (delta < 2) return baseVentilationKw;
+  if (tempC < comfortC) {
+    return baseVentilationKw + Math.min(7, 0.12 * delta + 0.004 * delta * delta);
+  }
+  return baseVentilationKw + Math.min(3, 0.1 * delta);
 }
 
 export function airDensityFromTempC(tempC: number, baseRho = 1.225, baseTempC = 15): number {
@@ -147,8 +216,9 @@ export function airDensityFromTempC(tempC: number, baseRho = 1.225, baseTempC = 
 }
 
 export function batteryPreconditioningKw(tempC: number): number {
-  const delta = Math.abs(tempC - 21);
-  return Math.max(3, Math.min(7, 3 + delta * 0.12));
+  if (tempC >= 10) return 0;
+  const delta = 10 - tempC;
+  return Math.max(0, Math.min(6, 1.5 + delta * 0.2));
 }
 
 export function routeEnergyTimeSegmentWeather(

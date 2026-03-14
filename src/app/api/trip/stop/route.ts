@@ -9,6 +9,20 @@ type Body = {
   batteryPctAfter?: number;
   notes?: string;
   remainingCoords?: [number, number][];
+  remainingEcoSpeedsKmh?: number[];
+  comfortTempC?: number;
+  vehicleProfile?: {
+    empty_mass?: number;
+    extra_load?: number;
+    drag_coefficient?: number;
+    frontal_area?: number;
+    rolling_resistance?: number;
+    motor_efficiency?: number;
+    regen_efficiency?: number;
+    aux_power_kw?: number;
+    battery_kwh?: number;
+    max_charge_kw?: number;
+  };
   distanceKm?: number;
   logbook?: Array<{
     id_segment: number;
@@ -39,6 +53,11 @@ export async function POST(req: NextRequest) {
     didRecharge: body.didRecharge,
     notes: body.notes,
     remainingCoords: body.remainingCoords,
+    remainingEcoSpeedsKmh: Array.isArray(body.remainingEcoSpeedsKmh)
+      ? body.remainingEcoSpeedsKmh.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+      : [],
+    comfortTempC: Number(body.comfortTempC ?? 20),
+    vehicleProfile: body.vehicleProfile ?? {},
     distanceKm: Number(body.distanceKm ?? 0),
     logbook: Array.isArray(body.logbook) ? body.logbook : [],
   });

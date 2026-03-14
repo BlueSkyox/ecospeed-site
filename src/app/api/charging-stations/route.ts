@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getRouteChargingContext, type ChargingStation } from "@/lib/charging-context";
-import { FALLBACK_STATIONS, fetchOpenChargeMapStations } from "@/lib/charging-stations";
+import { FALLBACK_STATIONS, fetchOpenChargeMapStations, fetchOverpassStations } from "@/lib/charging-stations";
 
 let cache: { ts: number; data: ChargingStation[] } | null = null;
+const STATIONS_CACHE_TTL_MS = 2 * 60_000;
 
 function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number) {
   const toRad = (x: number) => (x * Math.PI) / 180;
@@ -37,19 +38,47 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
+async function loadStations(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && cache && now - cache.ts < STATIONS_CACHE_TTL_MS && cache.data.length > 0) {
+    return cache.data;
+  }
+
+  let out: ChargingStation[] = cache?.data?.length ? cache.data : FALLBACK_STATIONS;
+  const liveSources = await Promise.allSettled([
+    withTimeout(fetchOpenChargeMapStations(), 8000),
+    withTimeout(fetchOverpassStations(), 9000),
+  ]);
+  const merged = liveSources
+    .filter((result): result is PromiseFulfilledResult<ChargingStation[]> => result.status === "fulfilled")
+    .flatMap((result) => result.value);
+  if (merged.length > 0) {
+    const dedup = new Map<string, ChargingStation>();
+    for (const station of merged) {
+      dedup.set(`${station.name}|${station.latitude.toFixed(4)}|${station.longitude.toFixed(4)}`, station);
+    }
+    out = [...dedup.values()];
+  }
+  cache = { ts: now, data: out };
+  return out;
+}
+
 export async function GET(req: NextRequest) {
+  const latRaw = req.nextUrl.searchParams.get("lat");
+  const lonRaw = req.nextUrl.searchParams.get("lon");
+  const latParam = latRaw === null ? Number.NaN : Number(latRaw);
+  const lonParam = lonRaw === null ? Number.NaN : Number(lonRaw);
+  const radiusKm = Math.max(1, Math.min(100, Number(req.nextUrl.searchParams.get("radius_km") ?? 10)));
+  const forceRefresh = req.nextUrl.searchParams.get("refresh") === "1";
+
   try {
-    const latRaw = req.nextUrl.searchParams.get("lat");
-    const lonRaw = req.nextUrl.searchParams.get("lon");
-    const latParam = latRaw === null ? Number.NaN : Number(latRaw);
-    const lonParam = lonRaw === null ? Number.NaN : Number(lonRaw);
-    const radiusKm = Math.max(5, Math.min(60, Number(req.nextUrl.searchParams.get("radius_km") ?? 20)));
+    const stations = await loadStations(forceRefresh);
 
     const routeScoped = getRouteChargingContext();
     if (routeScoped && routeScoped.length > 0) {
       let out = [...routeScoped];
       if (Number.isFinite(latParam) && Number.isFinite(lonParam)) {
-        const aroundUser = filterAround(cache?.data ?? FALLBACK_STATIONS, latParam, lonParam, radiusKm);
+        const aroundUser = filterAround(stations, latParam, lonParam, radiusKm);
         const dedup = new Map<string, ChargingStation>();
         for (const st of [...out, ...aroundUser]) {
           dedup.set(`${st.name}|${st.latitude.toFixed(4)}|${st.longitude.toFixed(4)}`, st);
@@ -59,20 +88,8 @@ export async function GET(req: NextRequest) {
       return NextResponse.json(out);
     }
 
-    const now = Date.now();
-    if (cache && now - cache.ts < 15 * 60_000 && cache.data.length > 0) {
-      return NextResponse.json(filterAround(cache.data, latParam, lonParam, radiusKm));
-    }
-
-    let out: ChargingStation[] = FALLBACK_STATIONS;
-    try {
-      const live = await withTimeout(fetchOpenChargeMapStations(), 8000);
-      if (live.length > 0) out = live;
-    } catch {}
-
-    cache = { ts: now, data: out };
-    return NextResponse.json(filterAround(out, latParam, lonParam, radiusKm));
+    return NextResponse.json(filterAround(stations, latParam, lonParam, radiusKm));
   } catch {
-    return NextResponse.json(FALLBACK_STATIONS);
+    return NextResponse.json(filterAround(FALLBACK_STATIONS, latParam, lonParam, radiusKm));
   }
 }

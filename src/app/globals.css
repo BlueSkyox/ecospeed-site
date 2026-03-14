@@ -1,186 +1,1031 @@
+:root {
+  --bg: #f4efe3;
+  --bg-strong: #eadfc7;
+  --surface: rgba(255, 251, 244, 0.9);
+  --surface-strong: #fffaf0;
+  --surface-dark: #163528;
+  --line: rgba(47, 74, 57, 0.14);
+  --line-strong: rgba(29, 56, 41, 0.24);
+  --text: #173125;
+  --muted: #577063;
+  --accent: #2f8f5b;
+  --accent-strong: #1d6f45;
+  --accent-soft: #dff3e4;
+  --warn: #a86b24;
+  --danger: #a64234;
+  --shadow: 0 24px 70px rgba(24, 48, 33, 0.12);
+  --radius-xl: 28px;
+  --radius-lg: 20px;
+  --radius-md: 14px;
+  --font-heading: "Space Grotesk", sans-serif;
+  --font-body: "Manrope", sans-serif;
+}
+
 *,
 *::before,
 *::after {
   box-sizing: border-box;
 }
 
-html,
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   margin: 0;
-  padding: 0;
+  min-height: 100vh;
+  color: var(--text);
+  font-family: var(--font-body);
+  background:
+    radial-gradient(circle at top left, rgba(100, 169, 114, 0.18), transparent 30%),
+    radial-gradient(circle at top right, rgba(224, 183, 116, 0.24), transparent 28%),
+    linear-gradient(180deg, #f8f2e6 0%, #f4efe3 55%, #efe7d5 100%);
 }
 
-.launch-panel {
-  position: relative;
-  width: min(1200px, calc(100vw - 24px));
-  margin: 16px auto 24px;
-  max-height: none;
-  overflow: visible;
-  z-index: 1;
-  background: rgba(248, 251, 247, 0.98);
-  border: 1px solid #cfe2d2;
-  border-radius: 14px;
-  box-shadow: 0 8px 28px rgba(27, 51, 38, 0.16);
-  padding: 12px;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+a {
+  color: inherit;
+  text-decoration: none;
 }
 
-.launch-panel h2,
-.launch-panel h3,
-.launch-panel p {
-  margin: 0 0 8px;
+button,
+input,
+select {
+  font: inherit;
 }
 
-.launch-form,
-.lp-inline {
+button {
+  cursor: pointer;
+}
+
+img {
+  max-width: 100%;
+  display: block;
+}
+
+.ecospeed-shell {
+  width: min(1280px, calc(100vw - 32px));
+  margin: 0 auto;
+  padding: 32px 0 64px;
+}
+
+.ecospeed-hero {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 24px;
+  align-items: stretch;
+  margin-bottom: 24px;
+}
+
+.ecospeed-hero__copy,
+.ecospeed-hero__panel,
+.ecospeed-pillar,
+.ecospeed-panel,
+.ecospeed-card,
+.ecospeed-map-card,
+.ecospeed-weather-card,
+.ecospeed-history-card,
+.ecospeed-nearby {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  background: var(--surface);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--shadow);
+}
+
+.ecospeed-hero__copy {
+  padding: 38px;
+}
+
+.ecospeed-hero__topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ecospeed-hero__panel {
+  padding: 32px;
+  background:
+    linear-gradient(165deg, rgba(31, 72, 50, 0.98), rgba(18, 42, 31, 0.96)),
+    var(--surface-dark);
+  color: #edf7ee;
+}
+
+.ecospeed-eyebrow,
+.ecospeed-kicker,
+.ecospeed-section-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.ecospeed-eyebrow,
+.ecospeed-section-label {
+  background: rgba(47, 143, 91, 0.1);
+  color: var(--accent-strong);
+}
+
+.ecospeed-kicker {
+  background: rgba(255, 255, 255, 0.08);
+  color: #d7efe0;
+}
+
+.ecospeed-locale-switch {
+  display: inline-flex;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.ecospeed-locale-switch button {
+  min-width: 48px;
+  min-height: 36px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.ecospeed-locale-switch button.is-active {
+  background: var(--accent-strong);
+  color: #fff;
+}
+
+.ecospeed-hero h1,
+.ecospeed-panel h2,
+.ecospeed-pillar h2,
+.ecospeed-card h3,
+.ecospeed-map-card h3,
+.ecospeed-weather-card h3,
+.ecospeed-history-card h3,
+.ecospeed-nearby h3 {
+  margin: 0;
+  font-family: var(--font-heading);
+  letter-spacing: -0.04em;
+}
+
+.ecospeed-hero h1 {
+  margin-top: 18px;
+  max-width: 12ch;
+  font-size: clamp(2.7rem, 5vw, 5.2rem);
+  line-height: 0.96;
+}
+
+.ecospeed-hero p {
+  max-width: 64ch;
+  margin: 18px 0 0;
+  font-size: 1.05rem;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.ecospeed-proof-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 10px;
+  gap: 10px;
+  margin-top: 24px;
 }
 
-.lp-topline {
+.ecospeed-proof-strip span {
+  padding: 11px 14px;
+  border: 1px solid rgba(47, 143, 91, 0.14);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.7);
+  font-weight: 700;
+}
+
+.ecospeed-checklist {
+  margin: 18px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 12px;
+}
+
+.ecospeed-checklist li {
+  position: relative;
+  padding-left: 18px;
+  color: rgba(237, 247, 238, 0.88);
+  line-height: 1.55;
+}
+
+.ecospeed-checklist li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #9fe0b1;
+}
+
+.ecospeed-pillars {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 18px;
+  margin-bottom: 24px;
+}
+
+.ecospeed-pillar {
+  padding: 24px;
+}
+
+.ecospeed-pillar p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.ecospeed-panel {
+  padding: 26px;
+}
+
+.ecospeed-panel__header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 22px;
+}
+
+.ecospeed-panel__header p {
+  max-width: 66ch;
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.ecospeed-panel__grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(340px, 0.85fr);
+  gap: 18px;
+}
+
+.ecospeed-card,
+.ecospeed-map-card,
+.ecospeed-weather-card,
+.ecospeed-history-card,
+.ecospeed-nearby {
+  padding: 22px;
+}
+
+.ecospeed-card--plain {
+  margin-top: 18px;
+}
+
+.ecospeed-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.ecospeed-field {
+  display: grid;
+  gap: 8px;
+}
+
+.ecospeed-inline-field {
+  display: grid;
+  gap: 8px;
+}
+
+.ecospeed-field label,
+.ecospeed-inline-field label {
+  font-size: 0.92rem;
+  font-weight: 700;
+}
+
+.ecospeed-field span,
+.ecospeed-inline-field span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.ecospeed-field input,
+.ecospeed-field select,
+.ecospeed-inline-field input,
+.ecospeed-inline-field select {
+  width: 100%;
+  min-height: 50px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.88);
+  padding: 0 14px;
+  color: var(--text);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.ecospeed-field input:focus,
+.ecospeed-field select:focus,
+.ecospeed-inline-field input:focus,
+.ecospeed-inline-field select:focus {
+  outline: none;
+  border-color: rgba(47, 143, 91, 0.45);
+  box-shadow: 0 0 0 4px rgba(47, 143, 91, 0.12);
+  background: #fff;
+}
+
+.ecospeed-field--wide {
+  grid-column: 1 / -1;
+}
+
+.ecospeed-panel h2 {
+  margin: 10px 0 0;
+  font-size: clamp(2rem, 4vw, 3rem);
+}
+
+.ecospeed-inline-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ecospeed-profile-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.ecospeed-actions,
+.ecospeed-trip-actions,
+.ecospeed-nearby__actions,
+.ecospeed-filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.ecospeed-button,
+.ecospeed-button--ghost,
+.ecospeed-button--soft,
+.ecospeed-pill-button {
+  min-height: 48px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0 18px;
+  font-weight: 800;
+  transition: transform 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.ecospeed-button {
+  background: linear-gradient(135deg, var(--accent), #55b574);
+  color: #f7fff9;
+  box-shadow: 0 14px 28px rgba(47, 143, 91, 0.24);
+}
+
+.ecospeed-button--ghost {
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+.ecospeed-button--soft,
+.ecospeed-pill-button {
+  background: rgba(47, 143, 91, 0.1);
+  color: var(--accent-strong);
+}
+
+.ecospeed-button:hover,
+.ecospeed-button--ghost:hover,
+.ecospeed-button--soft:hover,
+.ecospeed-pill-button:hover {
+  transform: translateY(-1px);
+}
+
+.ecospeed-pill-button.is-active {
+  background: var(--accent-strong);
+  color: #f6fff8;
+}
+
+.ecospeed-feedback {
+  margin: 14px 0 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  line-height: 1.55;
+  font-weight: 600;
+}
+
+.ecospeed-feedback--error {
+  background: rgba(166, 66, 52, 0.1);
+  color: var(--danger);
+}
+
+.ecospeed-feedback--ok {
+  background: rgba(47, 143, 91, 0.11);
+  color: var(--accent-strong);
+}
+
+.ecospeed-summary-grid,
+.ecospeed-kpi-grid,
+.ecospeed-secondary-grid,
+.ecospeed-bottom-grid,
+.ecospeed-history-grid {
+  display: grid;
+  gap: 16px;
+}
+
+.ecospeed-summary-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.ecospeed-kpi-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.ecospeed-secondary-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.ecospeed-story-grid,
+.ecospeed-gains-grid {
+  display: grid;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.ecospeed-story-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ecospeed-gains-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.ecospeed-bottom-grid {
+  grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+  margin-top: 18px;
+}
+
+.ecospeed-drive-card {
+  margin-top: 18px;
+  padding: 22px;
+  border: 1px solid rgba(29, 111, 69, 0.18);
+  border-radius: 24px;
+  background: linear-gradient(145deg, rgba(23, 49, 37, 0.96), rgba(32, 78, 55, 0.9));
+  color: #f3fbf5;
+  box-shadow: var(--shadow);
+}
+
+.ecospeed-drive-card__header h3 {
   margin-top: 10px;
 }
 
-.launch-form input,
-.lp-inline input {
-  min-width: 90px;
-  flex: 1 1 120px;
-  border: 1px solid #b8c8bc;
-  border-radius: 8px;
-  padding: 7px 8px;
-}
-
-.launch-panel button {
-  border: 1px solid #2f8d59;
-  background: #35c56f;
-  color: #08311f;
-  border-radius: 8px;
-  padding: 7px 10px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.launch-panel button:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-
-.lp-grid {
+.ecospeed-drive-grid,
+.ecospeed-achievements-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.ecospeed-drive-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.ecospeed-achievements-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.ecospeed-drive-metric,
+.ecospeed-achievement {
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ecospeed-drive-metric span,
+.ecospeed-achievement__status {
+  color: rgba(243, 251, 245, 0.72);
+  font-size: 0.84rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ecospeed-drive-metric strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 1.55rem;
+  line-height: 1.15;
+  font-family: var(--font-heading);
+}
+
+.ecospeed-achievement {
+  background: rgba(255, 255, 255, 0.62);
+  border-color: var(--line);
+}
+
+.ecospeed-achievement strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 1.05rem;
+}
+
+.ecospeed-achievement p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.ecospeed-achievement.is-earned {
+  background: rgba(223, 243, 228, 0.92);
+  border-color: rgba(29, 111, 69, 0.22);
+}
+
+.ecospeed-history-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 16px;
+}
+
+.ecospeed-stat,
+.ecospeed-kpi,
+.ecospeed-history-item,
+.ecospeed-stop,
+.ecospeed-weather-overview,
+.ecospeed-story-card,
+.ecospeed-gain-card {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.ecospeed-stat,
+.ecospeed-kpi,
+.ecospeed-history-item,
+.ecospeed-stop,
+.ecospeed-story-card,
+.ecospeed-gain-card {
+  padding: 16px;
+}
+
+.ecospeed-stat strong,
+.ecospeed-kpi strong,
+.ecospeed-history-item strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 1.45rem;
+  font-family: var(--font-heading);
+  line-height: 1.05;
+}
+
+.ecospeed-stat span,
+.ecospeed-kpi span,
+.ecospeed-history-item span,
+.ecospeed-stop span,
+.ecospeed-stop small,
+.ecospeed-muted {
+  color: var(--muted);
+}
+
+.ecospeed-kpi strong {
+  font-size: 2rem;
+}
+
+.ecospeed-story-card strong,
+.ecospeed-gain-card strong {
+  display: block;
+  margin-top: 10px;
+  font-size: 1.55rem;
+  font-family: var(--font-heading);
+  line-height: 1.05;
+}
+
+.ecospeed-story-card p,
+.ecospeed-gain-card p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.ecospeed-comparison {
+  margin-top: 18px;
+  overflow: hidden;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+}
+
+.ecospeed-comparison table,
+.ecospeed-segment-table table {
+  width: 100%;
+  border-collapse: collapse;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.ecospeed-comparison th,
+.ecospeed-comparison td,
+.ecospeed-segment-table th,
+.ecospeed-segment-table td {
+  padding: 14px 16px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.ecospeed-comparison th,
+.ecospeed-segment-table th {
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  background: rgba(47, 143, 91, 0.08);
+}
+
+.ecospeed-comparison tr + tr td,
+.ecospeed-segment-table tr + tr td {
+  border-top: 1px solid var(--line);
+}
+
+.ecospeed-segment-table {
+  margin-top: 16px;
+  overflow: auto;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+}
+
+.ecospeed-segment-table td strong {
+  font-size: 0.98rem;
+}
+
+.ecospeed-segment-table td span {
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.ecospeed-map-card,
+.ecospeed-weather-card,
+.ecospeed-history-card,
+.ecospeed-nearby {
+  margin-top: 18px;
+}
+
+.ecospeed-map {
+  overflow: hidden;
+  border-radius: 20px;
+  border: 1px solid var(--line);
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  font-family: var(--font-body);
+}
+
+.ecospeed-map-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.ecospeed-map-legend span {
+  display: inline-flex;
+  align-items: center;
   gap: 8px;
 }
 
-.lp-card {
-  border: 1px solid #d8e3d8;
-  border-radius: 10px;
-  background: #fff;
-  padding: 10px;
+.ecospeed-map-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
 }
 
-.lp-strong {
-  font-weight: 700;
+.ecospeed-map-dot--route {
+  background: #2f8f5b;
 }
 
-.lp-error {
-  color: #a01616;
-  font-weight: 700;
+.ecospeed-map-dot--stop {
+  background: #0e5c8d;
 }
 
-.lp-check {
+.ecospeed-map-dot--nearby {
+  background: #d88b29;
+}
+
+.ecospeed-stop-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.ecospeed-stop {
+  display: grid;
+  gap: 10px;
+}
+
+.ecospeed-stop.is-inactive {
+  opacity: 0.62;
+}
+
+.ecospeed-stop__topline {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 4px;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.test-tab {
-  position: fixed;
-  right: 14px;
-  bottom: 14px;
-  z-index: 1200;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+.ecospeed-stop__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 800;
+  color: var(--text);
 }
 
-.test-tab-toggle {
-  border: 1px solid #118757;
-  background: #22c473;
-  color: #073121;
+.ecospeed-stop__toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent-strong);
+}
+
+.ecospeed-stop__title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.ecospeed-stop__title strong {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.ecospeed-stop__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ecospeed-stop__meta span {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(47, 143, 91, 0.08);
+  color: var(--accent-strong);
+  font-size: 0.8rem;
   font-weight: 700;
-  border-radius: 10px;
-  padding: 10px 14px;
-  cursor: pointer;
 }
 
-.test-tab-panel {
-  width: min(420px, calc(100vw - 28px));
-  margin-top: 8px;
-  background: #f8fcf9;
-  border: 1px solid #cbe4d2;
-  border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(10, 30, 20, 0.18);
-  padding: 12px;
-}
-
-.test-tab-form {
+.ecospeed-stop__planner {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) 110px;
+  gap: 10px 12px;
+  align-items: center;
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid rgba(47, 143, 91, 0.14);
+  background: rgba(223, 243, 228, 0.45);
+}
+
+.ecospeed-stop__planner label {
+  font-weight: 700;
+}
+
+.ecospeed-stop__planner input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.94);
+  padding: 0 14px;
+  color: var(--text);
+}
+
+.ecospeed-stop__planner span {
+  grid-column: 1 / -1;
+  font-size: 0.82rem;
+}
+
+.ecospeed-badge-row,
+.ecospeed-weather-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.ecospeed-badge,
+.ecospeed-weather-tags span {
+  padding: 7px 10px;
+  border-radius: 999px;
+  background: rgba(47, 143, 91, 0.1);
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.ecospeed-results-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 20px 0 18px;
+}
+
+.ecospeed-results-nav__button {
+  min-height: 44px;
+  padding: 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--muted);
+  font-weight: 800;
+  transition: transform 140ms ease, background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.ecospeed-results-nav__button:hover {
+  transform: translateY(-1px);
+  border-color: rgba(29, 111, 69, 0.24);
+  color: var(--accent-strong);
+}
+
+.ecospeed-results-nav__button.is-active {
+  border-color: rgba(29, 111, 69, 0.24);
+  background: var(--accent-strong);
+  color: #fff;
+}
+
+.ecospeed-weather-overview {
+  padding: 18px;
+  margin-top: 16px;
+}
+
+.ecospeed-weather-chart {
+  margin-top: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.78);
+  padding: 16px;
+}
+
+.ecospeed-chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.ecospeed-chart-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ecospeed-chart-swatch {
+  width: 14px;
+  height: 3px;
+  border-radius: 999px;
+}
+
+.ecospeed-chart-swatch--temp {
+  background: #d88b29;
+}
+
+.ecospeed-chart-swatch--rain {
+  background: #2d74c4;
+}
+
+.ecospeed-inline-grid--trip {
+  margin-top: 18px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.ecospeed-history-empty,
+.ecospeed-empty-state {
+  margin-top: 14px;
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px dashed var(--line-strong);
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.42);
+}
+
+.ecospeed-range {
+  width: 100%;
+}
+
+.ecospeed-nearby__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: start;
+}
+
+.ecospeed-nearby__header p,
+.ecospeed-history-card p,
+.ecospeed-map-card p,
+.ecospeed-weather-card p {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.ecospeed-nearby__list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.ecospeed-nearby__item {
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.75);
+}
+
+.ecospeed-nearby__meta {
+  display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   margin-top: 8px;
 }
 
-.test-tab-form input {
-  border: 1px solid #b8cfbf;
-  border-radius: 8px;
-  padding: 7px 8px;
+.ecospeed-chip {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(29, 111, 69, 0.08);
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+  font-weight: 800;
 }
 
-.test-tab-form button {
-  grid-column: 1 / -1;
-  border: 1px solid #2f8d59;
-  background: #38ca77;
-  color: #08311f;
-  border-radius: 8px;
-  padding: 8px 10px;
-  font-weight: 700;
+.ecospeed-footnote {
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.6;
 }
 
-.test-tab-error {
-  color: #a01616;
-  font-weight: 700;
+@media (max-width: 1120px) {
+  .ecospeed-hero,
+  .ecospeed-panel__grid,
+  .ecospeed-bottom-grid,
+  .ecospeed-drive-grid,
+  .ecospeed-achievements-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ecospeed-pillars,
+  .ecospeed-summary-grid,
+  .ecospeed-history-grid,
+  .ecospeed-inline-grid--trip,
+  .ecospeed-gains-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
-.test-tab-result p {
-  margin: 6px 0;
-}
+@media (max-width: 820px) {
+  .ecospeed-shell {
+    width: min(100vw - 20px, 100%);
+    padding: 18px 0 42px;
+  }
 
-.test-weather-box {
-  margin-top: 8px;
-  border: 1px solid #bfe6cf;
-  border-radius: 10px;
-  background: #ffffff;
-  padding: 8px;
-}
+  .ecospeed-hero__topbar {
+    align-items: start;
+    flex-direction: column;
+  }
 
-.newtrip-weather-impact {
-  position: fixed;
-  left: 14px;
-  bottom: 14px;
-  z-index: 1200;
-  max-width: min(420px, calc(100vw - 28px));
-  border: 1px solid #bfe1ca;
-  background: rgba(248, 253, 249, 0.97);
-  border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(10, 30, 20, 0.17);
-  padding: 9px 10px;
-  font-size: 13px;
-  color: #173a2a;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
-}
+  .ecospeed-hero__copy,
+  .ecospeed-hero__panel,
+  .ecospeed-panel,
+  .ecospeed-card,
+  .ecospeed-map-card,
+  .ecospeed-weather-card,
+  .ecospeed-history-card,
+  .ecospeed-nearby,
+  .ecospeed-pillar {
+    padding: 20px;
+  }
 
-.newtrip-weather-title {
-  font-weight: 700;
-  margin-bottom: 4px;
+  .ecospeed-form,
+  .ecospeed-inline-grid,
+  .ecospeed-secondary-grid,
+  .ecospeed-kpi-grid,
+  .ecospeed-pillars,
+  .ecospeed-summary-grid,
+  .ecospeed-history-grid,
+  .ecospeed-inline-grid--trip,
+  .ecospeed-story-grid,
+  .ecospeed-gains-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .ecospeed-hero h1 {
+    max-width: none;
+    font-size: 2.8rem;
+  }
+
+  .ecospeed-stop__planner {
+    grid-template-columns: 1fr;
+  }
 }

@@ -1,10 +1,23 @@
 import type { Metadata } from "next";
+import { Manrope, Space_Grotesk } from "next/font/google";
+import "leaflet/dist/leaflet.css";
 import "./globals.css";
-import "./ecospeed-clone.css";
+
+const headingFont = Space_Grotesk({
+  subsets: ["latin"],
+  variable: "--font-heading",
+  display: "swap",
+});
+
+const bodyFont = Manrope({
+  subsets: ["latin"],
+  variable: "--font-body",
+  display: "swap",
+});
 
 export const metadata: Metadata = {
-  title: "ECOSPEED - EV Eco-Speed Optimizer",
-  description: "EV Eco-Speed Optimizer - Green Driving Optimizer for Electric Vehicles",
+  title: "EcoSpeed | Optimiseur de trajet VE",
+  description: "Optimisation eco-speed, recharge, meteo et visualisation de trajet pour vehicules electriques.",
   manifest: "/manifest.json",
   icons: {
     icon: [
@@ -22,13 +35,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <head>
-        <meta name="theme-color" content="#000000" />
-      </head>
-      <body>
-        {children}
-      </body>
+    <html lang="fr">
+      <body className={`${headingFont.variable} ${bodyFont.variable}`}>{children}</body>
     </html>
   );
 }

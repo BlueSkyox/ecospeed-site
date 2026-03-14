@@ -1,17 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createHash } from "crypto";
+import { promises as fs } from "fs";
+import path from "path";
 import {
   airDensityFromTempC,
   batteryPreconditioningKw,
+  estimateChargingMinutesFromEnergy,
   haversineM,
   hvacPowerFromTemp,
   rainDensityToCrrMultiplier,
+  rollingResistanceTempMultiplier,
   segEnergyAndTime,
 } from "@/lib/ev";
 import { setRouteChargingContext, type ChargingStation } from "@/lib/charging-context";
-import { FALLBACK_STATIONS, fetchOpenChargeMapStations } from "@/lib/charging-stations";
-
-const DEFAULT_ORS_API_KEY =
-  "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjA5MDkyNTdkYTlmNzQ5NmNhNjMxNzVjZGM1NTE0ZWYzIiwiaCI6Im11cm11cjY0In0=";
+import { FALLBACK_STATIONS, fetchOpenChargeMapStations, fetchOverpassStations } from "@/lib/charging-stations";
 
 const KNOWN_POINTS: Record<string, [number, number]> = {
   paris: [2.3522, 48.8566],
@@ -28,8 +30,89 @@ const KNOWN_POINTS: Record<string, [number, number]> = {
   dijon: [5.0415, 47.322],
 };
 
+type TimedCacheEntry<T> = {
+  value: T;
+  expiresAt: number;
+};
+
+const geocodeCache = new Map<string, TimedCacheEntry<[number, number]>>();
+const weatherPointCache = new Map<
+  string,
+  TimedCacheEntry<{ tempC: number; rainMmH: number; windKmh: number; windDirFromDeg: number }>
+>();
+const elevationChunkCache = new Map<string, TimedCacheEntry<number[]>>();
+const elevationRouteCache = new Map<string, TimedCacheEntry<number[]>>();
+const routeGeometryCache = new Map<
+  string,
+  TimedCacheEntry<{
+    coordsRaw: [number, number][];
+    elevations?: number[];
+    ascentM?: number;
+    descentM?: number;
+    orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
+    orsSteps: OrsStep[];
+  }>
+>();
+let stationsCache: TimedCacheEntry<ChargingStation[]> | null = null;
+const MIN_REALISTIC_CHARGE_STOP_MIN = 8;
+const CO2_FRANCE_KG_PER_KWH = 0.048;
+const PERSISTENT_CACHE_ROOT = path.join(process.cwd(), ".next", "cache", "ecospeed");
+
+function hasUsableOrsRouteGeometry(value: {
+  coordsRaw?: [number, number][];
+  ascentM?: number;
+  descentM?: number;
+} | null | undefined) {
+  if (!value || !Array.isArray(value.coordsRaw) || value.coordsRaw.length < 2) return false;
+  return Number.isFinite(Number(value.ascentM ?? Number.NaN)) && Number.isFinite(Number(value.descentM ?? Number.NaN));
+}
+
+function cacheGet<T>(cache: Map<string, TimedCacheEntry<T>>, key: string): T | null {
+  const now = Date.now();
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= now) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function cacheSet<T>(cache: Map<string, TimedCacheEntry<T>>, key: string, value: T, ttlMs: number) {
+  cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+function safeCacheFileKey(key: string) {
+  return key.replace(/[^a-z0-9_-]/gi, "_");
+}
+
+async function readPersistentJsonCache<T>(bucket: string, key: string, ttlMs: number): Promise<T | null> {
+  const file = path.join(PERSISTENT_CACHE_ROOT, bucket, `${safeCacheFileKey(key)}.json`);
+  try {
+    const stat = await fs.stat(file);
+    if (Date.now() - stat.mtimeMs > ttlMs) return null;
+    const raw = await fs.readFile(file, "utf8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function writePersistentJsonCache<T>(bucket: string, key: string, value: T) {
+  const dir = path.join(PERSISTENT_CACHE_ROOT, bucket);
+  const file = path.join(dir, `${safeCacheFileKey(key)}.json`);
+  try {
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(file, JSON.stringify(value), "utf8");
+  } catch {}
+}
+
 function orsKey() {
-  return process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY || DEFAULT_ORS_API_KEY;
+  const key = process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY;
+  if (!key) {
+    throw new Error("Missing OPENROUTESERVICE_API_KEY or ORS_API_KEY");
+  }
+  return key;
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -158,12 +241,15 @@ type WeatherEdgeOut = {
   distance_km: number;
   temp_c: number;
   rain_mmh: number;
+  wind_kmh: number;
+  headwind_ms: number;
   rain_crr_multiplier: number;
   hvac_kw: number;
   eco_speed_kmh: number;
   limit_speed_kmh: number;
   eco_energy_kwh: number;
   limit_energy_kwh: number;
+  eco_time_min?: number;
 };
 
 type StopOut = {
@@ -171,14 +257,143 @@ type StopOut = {
   lat: number;
   lon: number;
   station: ChargingStation;
+  distKmFromRoute?: number;
+  stationScore?: number;
   batteryLevelAtCharge: number;
+  driveTimeFromPreviousStopMin?: number;
+  driveDistanceFromPreviousStopKm?: number;
+  minimumEnergyToCharge: number;
+  minimumTargetBatteryPct: number;
+  minimumChargingTimeMinutes: number;
+  minimumChargingTimeMinutesRaw?: number;
+  targetBatteryPct?: number;
+  batteryPctAfterCharge?: number;
   chargingTimeMinutes: number;
+  chargingTimeMinutesRaw?: number;
+  chargingTimeIsMinimum?: boolean;
   energyToCharge: number;
+  estimatedChargeCostEur?: number;
 };
+
+type RouteRange = {
+  from: number;
+  to: number;
+};
+
+type PlanningSegmentCandidate = {
+  speed: number;
+  energyKwh: number;
+  timeMin: number;
+  avgTemp: number;
+  avgRain: number;
+  edgeEnergyKwh: number[];
+  edgeTimeMin: number[];
+};
+
+type PlanningSegmentBase = {
+  from: number;
+  to: number;
+  lat_start: number;
+  lon_start: number;
+  lat_end: number;
+  lon_end: number;
+  distance_m: number;
+  way_type: number;
+  speed_limit: number;
+  avgTemp: number;
+  avgRain: number;
+  limitEnergyKwh: number;
+  limitTimeMin: number;
+  candidates: PlanningSegmentCandidate[];
+};
+
+type MappedRouteStation = {
+  st: ChargingStation;
+  coordIdx: number;
+  distKm: number;
+};
+
+function mergeSegmentPair(a: SegmentOut, b: SegmentOut): SegmentOut {
+  const totalDistanceM = a.distance_m + b.distance_m;
+  const weightedTemp =
+    totalDistanceM > 0 ? (a.temp_c_avg * a.distance_m + b.temp_c_avg * b.distance_m) / totalDistanceM : a.temp_c_avg;
+  const weightedRain =
+    totalDistanceM > 0 ? (a.rain_mmh_avg * a.distance_m + b.rain_mmh_avg * b.distance_m) / totalDistanceM : a.rain_mmh_avg;
+  const mergedEcoSpeed =
+    totalDistanceM > 0 ? (a.eco_speed * a.distance_m + b.eco_speed * b.distance_m) / totalDistanceM : a.eco_speed;
+
+  return {
+    ...a,
+    lat_end: b.lat_end,
+    lon_end: b.lon_end,
+    distance_m: totalDistanceM,
+    distance: totalDistanceM,
+    distance_km: totalDistanceM / 1000,
+    distanceKm: totalDistanceM / 1000,
+    eco_speed: Number(mergedEcoSpeed.toFixed(1)),
+    ecoSpeed: Number(mergedEcoSpeed.toFixed(1)),
+    eco_energy: a.eco_energy + b.eco_energy,
+    ecoEnergy: a.ecoEnergy + b.ecoEnergy,
+    real_energy: a.real_energy + b.real_energy,
+    limit_energy: a.limit_energy + b.limit_energy,
+    limitEnergy: a.limitEnergy + b.limitEnergy,
+    eco_cost_eur: a.eco_cost_eur + b.eco_cost_eur,
+    limit_cost_eur: a.limit_cost_eur + b.limit_cost_eur,
+    eco_time: a.eco_time + b.eco_time,
+    real_time: a.real_time + b.real_time,
+    limit_time: a.limit_time + b.limit_time,
+    eco_time_min: a.eco_time_min + b.eco_time_min,
+    ecoTimeMin: a.ecoTimeMin + b.ecoTimeMin,
+    limit_time_min: a.limit_time_min + b.limit_time_min,
+    limitTimeMin: a.limitTimeMin + b.limitTimeMin,
+    temp_c_avg: weightedTemp,
+    rain_mmh_avg: weightedRain,
+    duration: a.duration + b.duration,
+  };
+}
+
+function normalizeSegments(
+  segments: SegmentOut[],
+  ranges: Array<{ from: number; to: number }>,
+): { segments: SegmentOut[]; ranges: Array<{ from: number; to: number }> } {
+  if (segments.length <= 1 || segments.length !== ranges.length) return { segments, ranges };
+
+  const mergedSegments: SegmentOut[] = [];
+  const mergedRanges: Array<{ from: number; to: number }> = [];
+
+  for (let i = 0; i < segments.length; i += 1) {
+    let accSeg = { ...segments[i] };
+    let accRange = { ...ranges[i] };
+
+    while (i + 1 < segments.length) {
+      const nextSeg = segments[i + 1];
+      const nextRange = ranges[i + 1];
+      const sameRoadClass = Math.abs(accSeg.speed_limit - nextSeg.speed_limit) <= 10 && accSeg.way_type === nextSeg.way_type;
+      const tooSmall = accSeg.distance_km < 0.15 || accSeg.eco_time_min < 0.25;
+      const nextTooSmall = nextSeg.distance_km < 0.15 || nextSeg.eco_time_min < 0.25;
+      if (!(sameRoadClass && (tooSmall || nextTooSmall))) break;
+      accSeg = mergeSegmentPair(accSeg, nextSeg);
+      accRange = { from: accRange.from, to: nextRange.to };
+      i += 1;
+    }
+
+    mergedSegments.push({
+      ...accSeg,
+      idx: mergedSegments.length + 1,
+      index: mergedSegments.length + 1,
+    });
+    mergedRanges.push(accRange);
+  }
+
+  return { segments: mergedSegments, ranges: mergedRanges };
+}
 
 async function geocode(text: string): Promise<[number, number]> {
   const known = knownPointLookup(text);
   if (known) return known;
+  const cacheKey = normalizePlace(text);
+  const cached = cacheGet(geocodeCache, cacheKey);
+  if (cached) return cached;
   const url = `https://api.openrouteservice.org/geocode/search?api_key=${encodeURIComponent(
     orsKey(),
   )}&text=${encodeURIComponent(text)}&size=1`;
@@ -187,7 +402,9 @@ async function geocode(text: string): Promise<[number, number]> {
   const data = await r.json();
   const coord = data?.features?.[0]?.geometry?.coordinates;
   if (!Array.isArray(coord) || coord.length < 2) throw new Error("Address not found");
-  return [Number(coord[0]), Number(coord[1])];
+  const out: [number, number] = [Number(coord[0]), Number(coord[1])];
+  cacheSet(geocodeCache, cacheKey, out, 30 * 60 * 1000);
+  return out;
 }
 
 async function resolvePoint(input: string): Promise<[number, number]> {
@@ -202,28 +419,234 @@ async function resolvePoint(input: string): Promise<[number, number]> {
   }
 }
 
-async function fetchElevations(coords: [number, number][]) {
-  const out = new Array(coords.length).fill(0);
-  try {
-    const chunkSize = 90;
-    for (let i = 0; i < coords.length; i += chunkSize) {
-      const chunk = coords.slice(i, i + chunkSize);
-      const locations = chunk.map((c) => `${c[1]},${c[0]}`).join("|");
+function elevationCoordsKey(coords: [number, number][]) {
+  const h = createHash("sha1");
+  for (const [lon, lat] of coords) h.update(`${lon.toFixed(5)},${lat.toFixed(5)};`);
+  return `${coords.length}:${h.digest("hex")}`;
+}
+
+function routeGeometryKey(start: [number, number], end: [number, number]) {
+  const h = createHash("sha1");
+  h.update(`${start[0].toFixed(5)},${start[1].toFixed(5)}->${end[0].toFixed(5)},${end[1].toFixed(5)}`);
+  return h.digest("hex");
+}
+
+function elevationVariationScore(elevations: number[]) {
+  let score = 0;
+  for (let i = 1; i < elevations.length; i += 1) {
+    const a = Number(elevations[i - 1] ?? 0);
+    const b = Number(elevations[i] ?? a);
+    score += Math.abs(b - a);
+  }
+  return score;
+}
+
+function smoothElevations(elevations: number[]) {
+  if (elevations.length <= 2) return elevations;
+  return elevations.map((value, idx) => {
+    const prev = elevations[idx - 1] ?? value;
+    const next = elevations[idx + 1] ?? value;
+    return (prev + value + next) / 3;
+  });
+}
+
+async function fetchElevationChunk(coords: [number, number][]) {
+  const cacheKey = elevationCoordsKey(coords);
+  const cached = cacheGet(elevationChunkCache, cacheKey);
+  if (cached && cached.length === coords.length) return cached;
+
+  const latCsv = coords.map((c) => c[1].toFixed(6)).join(",");
+  const lonCsv = coords.map((c) => c[0].toFixed(6)).join(",");
+  let lastError: Error | null = null;
+  const providers = [
+    async () => {
+      const r = await withTimeout(
+        fetch(`https://api.open-meteo.com/v1/elevation?latitude=${latCsv}&longitude=${lonCsv}`, {
+          cache: "no-store",
+        }),
+        8000,
+      );
+      if (!r.ok) throw new Error(`open-meteo elevation failed: ${r.status}`);
+      const j = await r.json();
+      const vals = Array.isArray(j?.elevation) ? j.elevation.map((x: unknown) => Number(x)) : [];
+      if (vals.length !== coords.length || vals.some((x: number) => !Number.isFinite(x))) {
+        throw new Error("open-meteo elevation invalid");
+      }
+      return vals;
+    },
+    async () => {
+      const locations = coords.map((c) => `${c[1]},${c[0]}`).join("|");
       const r = await withTimeout(
         fetch(`https://api.open-elevation.com/api/v1/lookup?locations=${encodeURIComponent(locations)}`, {
           cache: "no-store",
         }),
         8000,
       );
-      if (!r.ok) return out;
+      if (!r.ok) throw new Error(`open-elevation failed: ${r.status}`);
       const j = await r.json();
       const vals = (j?.results ?? []).map((x: { elevation?: number }) => Number(x.elevation ?? 0));
-      for (let k = 0; k < vals.length; k += 1) out[i + k] = vals[k];
+      if (vals.length !== coords.length || vals.some((x: number) => !Number.isFinite(x))) {
+        throw new Error("open-elevation invalid");
+      }
+      return vals;
+    },
+  ];
+
+  for (const provider of providers) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const vals = await provider();
+        cacheSet(elevationChunkCache, cacheKey, vals, 12 * 60 * 60 * 1000);
+        return vals;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error("elevation chunk failed");
+      }
     }
-    return out;
-  } catch {
-    return out;
   }
+  throw lastError ?? new Error("elevation chunk failed");
+}
+
+async function fetchElevationsOnce(coords: [number, number][]) {
+  const out: number[] = [];
+  const chunkSize = 90;
+  for (let i = 0; i < coords.length; i += chunkSize) {
+    const chunk = coords.slice(i, i + chunkSize);
+    const vals = await fetchElevationChunk(chunk);
+    out.push(...vals);
+  }
+  if (out.length !== coords.length) throw new Error("elevation profile incomplete");
+  return out;
+}
+
+async function fetchElevations(coords: [number, number][]) {
+  if (coords.length === 0) return [];
+  const routeKey = elevationCoordsKey(coords);
+  const cached = cacheGet(elevationRouteCache, routeKey);
+  if (cached && cached.length === coords.length) return cached;
+  const persisted = await readPersistentJsonCache<number[]>("elevation-route", routeKey, 12 * 60 * 60 * 1000);
+  if (persisted && persisted.length === coords.length) {
+    cacheSet(elevationRouteCache, routeKey, persisted, 12 * 60 * 60 * 1000);
+    return persisted;
+  }
+
+  let best: number[] | null = null;
+  let bestScore = -1;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const vals = await fetchElevationsOnce(coords);
+      const score = elevationVariationScore(vals);
+      if (score > bestScore) {
+        best = vals;
+        bestScore = score;
+      }
+      if (score > 50) break;
+    } catch {}
+  }
+
+  if (best && best.length === coords.length) {
+    cacheSet(elevationRouteCache, routeKey, best, 12 * 60 * 60 * 1000);
+    await writePersistentJsonCache("elevation-route", routeKey, best);
+    return best;
+  }
+  return cached ?? persisted ?? new Array(coords.length).fill(0);
+}
+
+async function fetchRouteGeometry(
+  startCoord: [number, number],
+  endCoord: [number, number],
+): Promise<{
+  coordsRaw: [number, number][];
+  elevations: number[];
+  ascentM: number;
+  descentM: number;
+  orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
+  orsSteps: OrsStep[];
+  routeSource: "ors";
+}> {
+  const cacheKey = routeGeometryKey(startCoord, endCoord);
+  const cached = cacheGet(routeGeometryCache, cacheKey);
+  if (hasUsableOrsRouteGeometry(cached)) {
+    const cachedRoute = cached as {
+      coordsRaw: [number, number][];
+      elevations?: number[];
+      ascentM: number;
+      descentM: number;
+      orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
+      orsSteps: OrsStep[];
+    };
+    return {
+      coordsRaw: cachedRoute.coordsRaw,
+      elevations: Array.isArray(cachedRoute.elevations) ? cachedRoute.elevations : [],
+      ascentM: Number(cachedRoute.ascentM),
+      descentM: Number(cachedRoute.descentM),
+      orsSeg0: cachedRoute.orsSeg0,
+      orsSteps: cachedRoute.orsSteps,
+      routeSource: "ors" as const,
+    };
+  }
+  if (cached) routeGeometryCache.delete(cacheKey);
+  const persisted = await readPersistentJsonCache<{
+    coordsRaw: [number, number][];
+    elevations?: number[];
+    ascentM?: number;
+    descentM?: number;
+    orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
+    orsSteps: OrsStep[];
+  }>("route-geometry", cacheKey, 30 * 60 * 1000);
+  if (hasUsableOrsRouteGeometry(persisted)) {
+    const persistedRoute = persisted as {
+      coordsRaw: [number, number][];
+      elevations?: number[];
+      ascentM: number;
+      descentM: number;
+      orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
+      orsSteps: OrsStep[];
+    };
+    cacheSet(routeGeometryCache, cacheKey, persistedRoute, 30 * 60 * 1000);
+    return {
+      coordsRaw: persistedRoute.coordsRaw,
+      elevations: Array.isArray(persistedRoute.elevations) ? persistedRoute.elevations : [],
+      ascentM: persistedRoute.ascentM,
+      descentM: persistedRoute.descentM,
+      orsSeg0: persistedRoute.orsSeg0,
+      orsSteps: persistedRoute.orsSteps,
+      routeSource: "ors" as const,
+    };
+  }
+
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const routeResp = await withTimeout(
+        fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
+          method: "POST",
+          headers: { Authorization: orsKey(), "Content-Type": "application/json" },
+          body: JSON.stringify({ coordinates: [startCoord, endCoord], instructions: true, elevation: true }),
+          cache: "no-store",
+        }),
+        15000,
+      );
+      if (!routeResp.ok) throw new Error(`Route failed: ${routeResp.status}`);
+      const data = await routeResp.json();
+      const feat = data?.features?.[0];
+      const maybeCoords = feat?.geometry?.coordinates as [number, number, number?][] | undefined;
+      if (!Array.isArray(maybeCoords) || maybeCoords.length < 2) throw new Error("No route geometry");
+      const coordsRaw = maybeCoords.map((coord) => [Number(coord[0]), Number(coord[1])] as [number, number]);
+      const elevations = maybeCoords.map((coord) => Number(coord[2] ?? 0));
+      const ascentM = Number(feat?.properties?.ascent ?? Number.NaN);
+      const descentM = Number(feat?.properties?.descent ?? Number.NaN);
+      const orsSeg0 = feat?.properties?.segments?.[0] as { distance?: number; duration?: number; steps?: OrsStep[] };
+      const orsSteps = (Array.isArray(orsSeg0?.steps) ? orsSeg0.steps : []) as OrsStep[];
+      const value = { coordsRaw, elevations, ascentM, descentM, orsSeg0, orsSteps };
+      cacheSet(routeGeometryCache, cacheKey, value, 30 * 60 * 1000);
+      await writePersistentJsonCache("route-geometry", cacheKey, value);
+      return { ...value, routeSource: "ors" as const };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Route failed");
+    }
+  }
+
+  throw lastError ?? new Error("Route failed");
 }
 
 function pickSampleIndices(totalPoints: number, maxSamples: number): number[] {
@@ -234,10 +657,16 @@ function pickSampleIndices(totalPoints: number, maxSamples: number): number[] {
   return [...new Set(out)].sort((a, b) => a - b);
 }
 
-async function fetchPointWeather(lat: number, lon: number): Promise<{ tempC: number; rainMmH: number }> {
+async function fetchPointWeather(
+  lat: number,
+  lon: number,
+): Promise<{ tempC: number; rainMmH: number; windKmh: number; windDirFromDeg: number }> {
+  const cacheKey = `${lat.toFixed(3)},${lon.toFixed(3)}`;
+  const cached = cacheGet(weatherPointCache, cacheKey);
+  if (cached) return cached;
   const r = await withTimeout(
     fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain`,
+      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain,wind_speed_10m,wind_direction_10m`,
       { cache: "no-store" },
     ),
     7000,
@@ -245,7 +674,44 @@ async function fetchPointWeather(lat: number, lon: number): Promise<{ tempC: num
   if (!r.ok) throw new Error("weather fetch failed");
   const j = await r.json();
   const cur = j?.current ?? {};
-  return { tempC: Number(cur.temperature_2m ?? 20), rainMmH: Number(cur.rain ?? cur.precipitation ?? 0) };
+  const out = {
+    tempC: Number(cur.temperature_2m ?? 20),
+    rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
+    windKmh: Math.max(0, Number(cur.wind_speed_10m ?? 0)),
+    windDirFromDeg: ((Number(cur.wind_direction_10m ?? 0) % 360) + 360) % 360,
+  };
+  cacheSet(weatherPointCache, cacheKey, out, 10 * 60 * 1000);
+  return out;
+}
+
+async function getStationsCached(): Promise<ChargingStation[]> {
+  const now = Date.now();
+  if (stationsCache && stationsCache.expiresAt > now && stationsCache.value.length > 0) return stationsCache.value;
+  const mergeStations = (base: ChargingStation[], extra: ChargingStation[]) => {
+    const dedup = new Map<string, ChargingStation>();
+    for (const st of [...base, ...extra]) {
+      const key = `${st.name}|${Number(st.latitude).toFixed(4)}|${Number(st.longitude).toFixed(4)}`;
+      if (!dedup.has(key)) dedup.set(key, st);
+    }
+    return [...dedup.values()];
+  };
+  try {
+    const liveSources = await Promise.allSettled([
+      withTimeout(fetchOpenChargeMapStations(), 8000),
+      withTimeout(fetchOverpassStations(), 9000),
+    ]);
+    const live = liveSources
+      .filter((result): result is PromiseFulfilledResult<ChargingStation[]> => result.status === "fulfilled")
+      .flatMap((result) => result.value);
+    if (live.length > 0) {
+      const merged = mergeStations(live, FALLBACK_STATIONS);
+      stationsCache = { value: merged, expiresAt: now + 10 * 60 * 1000 };
+      return merged;
+    }
+  } catch {}
+  const fallback = FALLBACK_STATIONS;
+  stationsCache = { value: fallback, expiresAt: now + 2 * 60 * 1000 };
+  return fallback;
 }
 
 function interpolateByIndex(valuesBySample: Map<number, number>, length: number): number[] {
@@ -267,33 +733,84 @@ function interpolateByIndex(valuesBySample: Map<number, number>, length: number)
   return out;
 }
 
+function bearingRadFromNorth(lon1: number, lat1: number, lon2: number, lat2: number) {
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dLon);
+  return Math.atan2(y, x);
+}
+
 async function fetchRouteWeather(coords: [number, number][]) {
   try {
     const sampleIdx = pickSampleIndices(coords.length, 12);
-    const samples = await Promise.all(
+    const settled = await Promise.allSettled(
       sampleIdx.map(async (idx) => {
         const [lon, lat] = coords[idx];
         const w = await fetchPointWeather(lat, lon);
-        return { idx, tempC: w.tempC, rainMmH: Math.max(0, w.rainMmH) };
+        return {
+          idx,
+          tempC: w.tempC,
+          rainMmH: Math.max(0, w.rainMmH),
+          windKmh: Math.max(0, w.windKmh),
+          windDirFromDeg: w.windDirFromDeg,
+        };
       }),
     );
+    const samples = settled
+      .filter((res): res is PromiseFulfilledResult<{
+        idx: number;
+        tempC: number;
+        rainMmH: number;
+        windKmh: number;
+        windDirFromDeg: number;
+      }> => res.status === "fulfilled")
+      .map((res) => res.value);
+    if (samples.length === 0) throw new Error("weather samples unavailable");
     const tempMap = new Map<number, number>();
     const rainMap = new Map<number, number>();
+    const windUxMap = new Map<number, number>();
+    const windUyMap = new Map<number, number>();
     for (const s of samples) {
       tempMap.set(s.idx, s.tempC);
       rainMap.set(s.idx, s.rainMmH);
+      const windToRad = (((s.windDirFromDeg + 180) % 360) * Math.PI) / 180;
+      const windMs = s.windKmh / 3.6;
+      windUxMap.set(s.idx, windMs * Math.sin(windToRad));
+      windUyMap.set(s.idx, windMs * Math.cos(windToRad));
     }
     const pointTemp = interpolateByIndex(tempMap, coords.length);
     const pointRain = interpolateByIndex(rainMap, coords.length);
+    const pointWindUx = interpolateByIndex(windUxMap, coords.length);
+    const pointWindUy = interpolateByIndex(windUyMap, coords.length);
+    const edgeWindMs = pointWindUx
+      .slice(1)
+      .map((ux, i) => Math.sqrt(((ux + pointWindUx[i]) / 2) ** 2 + ((pointWindUy[i + 1] + pointWindUy[i]) / 2) ** 2));
+    const edgeHeadwindMs = coords.slice(1).map((c, i) => {
+      const [lon1, lat1] = coords[i];
+      const [lon2, lat2] = c;
+      const b = bearingRadFromNorth(lon1, lat1, lon2, lat2);
+      const dirX = Math.sin(b);
+      const dirY = Math.cos(b);
+      const ux = (pointWindUx[i + 1] + pointWindUx[i]) / 2;
+      const uy = (pointWindUy[i + 1] + pointWindUy[i]) / 2;
+      const tailwindMs = ux * dirX + uy * dirY;
+      return -tailwindMs;
+    });
     return {
       edgeTemp: pointTemp.slice(1).map((v, i) => (v + pointTemp[i]) / 2),
       edgeRain: pointRain.slice(1).map((v, i) => Math.max(0, (v + pointRain[i]) / 2)),
-      samples: sampleIdx.length,
+      edgeWindMs,
+      edgeHeadwindMs,
+      samples: samples.length,
     };
   } catch {
     return {
       edgeTemp: new Array(Math.max(0, coords.length - 1)).fill(20),
       edgeRain: new Array(Math.max(0, coords.length - 1)).fill(0),
+      edgeWindMs: new Array(Math.max(0, coords.length - 1)).fill(0),
+      edgeHeadwindMs: new Array(Math.max(0, coords.length - 1)).fill(0),
       samples: 0,
     };
   }
@@ -344,6 +861,39 @@ function snapToFrenchLegalLimit(limit: number, userMax: number) {
     }
   }
   return best;
+}
+
+function roundSpeedToNearestStep(speedKmh: number, stepKmh: number) {
+  return Math.max(stepKmh, Math.round(speedKmh / stepKmh) * stepKmh);
+}
+
+function buildEcoSpeedCandidates(speedLimit: number) {
+  const stepKmh = 5;
+  const roundedLimit = roundSpeedToNearestStep(speedLimit, stepKmh);
+  const motorwayFloor = 100;
+  const ecoFloor =
+    roundedLimit >= 130
+      ? motorwayFloor
+      : roundedLimit >= 110
+        ? motorwayFloor
+        : roundedLimit >= 90
+          ? 55
+          : roundedLimit >= 80
+            ? 50
+            : roundedLimit >= 70
+              ? 45
+              : roundedLimit >= 50
+                ? 30
+                : Math.max(20, roundedLimit - 20);
+  const out: number[] = [];
+  for (let v = roundedLimit; v >= ecoFloor; v -= stepKmh) out.push(v);
+  if (!out.includes(ecoFloor)) out.push(ecoFloor);
+  return [...new Set(out)].sort((a, b) => b - a);
+}
+
+function cabinClimateAuxKw(tempC: number, comfortTempC: number, climateEnabled: boolean) {
+  const baseVentilationKw = hvacPowerFromTemp(comfortTempC, comfortTempC);
+  return climateEnabled ? hvacPowerFromTemp(tempC, comfortTempC) : baseVentilationKw;
 }
 
 function co2Equivalents(co2Kg: number) {
@@ -424,93 +974,215 @@ function listStationsNearPoint(stations: ChargingStation[], lon: number, lat: nu
   return near.map((x) => ({ ...x.st, distanceKm: x.distKm }));
 }
 
+function mapStationsToRoute(stations: ChargingStation[], coords: [number, number][], maxDistKm = 25) {
+  return stations
+    .map((st) => {
+      const near = nearestPointOnRoute(st, coords);
+      return { st, coordIdx: near.coordIdx, distKm: near.distM / 1000 };
+    })
+    .filter((item) => item.distKm <= maxDistKm)
+    .sort((a, b) => {
+      if (a.coordIdx !== b.coordIdx) return a.coordIdx - b.coordIdx;
+      if (a.distKm !== b.distKm) return a.distKm - b.distKm;
+      return Number(b.st.powerKw ?? 0) - Number(a.st.powerKw ?? 0);
+    });
+}
+
+function estimateChargingMinutes(
+  currentEnergyKwh: number,
+  targetEnergyKwh: number,
+  batteryKwh: number,
+  vehicleMaxChargeKw: number,
+  stationPowerKw: number,
+) {
+  return estimateChargingMinutesFromEnergy(
+    currentEnergyKwh,
+    targetEnergyKwh,
+    batteryKwh,
+    vehicleMaxChargeKw,
+    stationPowerKw,
+  );
+}
+
+function estimateStationPriceEurPerKwh(station: ChargingStation) {
+  const raw = String(station.price ?? "").replace(",", ".").replace(/[€$]/g, "");
+  const match = raw.match(/(\d+(?:\.\d+)?)\s*(?:eur)?\s*\/\s*kwh/i);
+  if (match) return Math.max(0, Number(match[1]));
+  const powerKw = Number(station.powerKw ?? 0);
+  if (powerKw >= 300) return 0.69;
+  if (powerKw >= 200) return 0.62;
+  if (powerKw >= 150) return 0.56;
+  if (powerKw >= 100) return 0.49;
+  if (powerKw >= 50) return 0.43;
+  return 0.35;
+}
+
+function stationQualityScore(station: ChargingStation, distKmFromRoute: number, segIdx: number) {
+  const powerScore = Math.min(400, Number(station.powerKw ?? 0)) / 400;
+  const distancePenalty = Math.min(1, Math.max(0, distKmFromRoute) / 12);
+  const operator = String(station.operator ?? "").toLowerCase();
+  const operatorBonus =
+    operator.includes("ionity") || operator.includes("tesla") || operator.includes("fastned")
+      ? 0.08
+      : operator.includes("electra") || operator.includes("total")
+        ? 0.04
+        : 0;
+  return segIdx * 2 + powerScore + operatorBonus - distancePenalty;
+}
+
 function planChargingStops(
-  mode: "eco_energy" | "limit_energy",
-  segments: SegmentOut[],
+  mappedStations: MappedRouteStation[],
   coords: [number, number][],
-  stepRanges: Array<{ from: number; to: number }>,
-  stations: ChargingStation[],
+  displayRanges: RouteRange[],
+  coordEnergyPrefix: number[],
+  coordTimePrefix: number[],
   batteryKwh: number,
   startPct: number,
   targetEndPct: number,
   maxChargeKw: number,
 ): StopOut[] {
-  const n = segments.length;
-  if (n === 0) return [];
-  const reserve = batteryKwh * (Math.max(10, targetEndPct) / 100);
-  const maxCharge = batteryKwh * 0.8;
-  const minChargeTarget = batteryKwh * 0.8;
+  if (coords.length < 2 || coordEnergyPrefix.length !== coords.length || coordTimePrefix.length !== coords.length) return [];
+  const finalReserve = batteryKwh * (Math.max(10, targetEndPct) / 100);
+  const legReserve = batteryKwh * 0.1;
+  const maxChargeSoc = 0.95;
+  const maxCharge = batteryKwh * maxChargeSoc;
   const minArrivalBuffer = Math.max(0.8, batteryKwh * 0.01);
-  const prefix = new Array(n + 1).fill(0);
-  for (let i = 0; i < n; i += 1) prefix[i + 1] = prefix[i] + Number(segments[i][mode] ?? 0);
-  const totalEnergy = prefix[n];
-
-  const mappedRaw = stations
-    .map((st) => {
-      const near = nearestPointOnRoute(st, coords);
-      const segIdx = coordToSegIndex(near.coordIdx, stepRanges);
-      return { st, segIdx, distKm: near.distM / 1000 };
-    })
-    .filter((x) => x.distKm <= 12);
-  if (mappedRaw.length === 0) return [];
-
-  const bySeg = new Map<number, { st: ChargingStation; segIdx: number; distKm: number }>();
-  for (const m of mappedRaw) {
-    const cur = bySeg.get(m.segIdx);
-    if (!cur) {
-      bySeg.set(m.segIdx, m);
-      continue;
-    }
-    const curPower = Number(cur.st.powerKw ?? 0);
-    const nextPower = Number(m.st.powerKw ?? 0);
-    if (nextPower > curPower || (nextPower === curPower && m.distKm < cur.distKm)) bySeg.set(m.segIdx, m);
-  }
-  const mapped = [...bySeg.values()].sort((a, b) => a.segIdx - b.segIdx);
+  const departureBuffer = Math.max(2, batteryKwh * 0.06);
+  const totalEnergy = coordEnergyPrefix[coordEnergyPrefix.length - 1];
+  const targetRestMinutes = 120;
+  const preferredRestMin = 95;
+  const preferredRestMax = 145;
+  const mapped = mappedStations;
   if (mapped.length === 0) return [];
 
+  type CandidateStop = MappedRouteStation & {
+    driveE: number;
+    driveTimeMin: number;
+    driveDistanceKm: number;
+  };
+
+  const canContinueFrom = (coordIdx: number) => {
+    const remainingFromStop = totalEnergy - coordEnergyPrefix[coordIdx];
+    if (maxCharge >= remainingFromStop + finalReserve + minArrivalBuffer) return true;
+    return mapped.some((nextStop) => {
+      if (nextStop.coordIdx <= coordIdx) return false;
+      const eToNext = coordEnergyPrefix[nextStop.coordIdx] - coordEnergyPrefix[coordIdx];
+      return eToNext <= Math.max(0, maxCharge - minArrivalBuffer);
+    });
+  };
+
+  const buildReachableCandidates = (fromCoordIdx: number, availableEnergyKwh: number): CandidateStop[] =>
+    mapped
+      .filter((m) => m.coordIdx > fromCoordIdx)
+      .map((m) => {
+        const driveE = coordEnergyPrefix[m.coordIdx] - coordEnergyPrefix[fromCoordIdx];
+        const driveTimeMin = coordTimePrefix[m.coordIdx] - coordTimePrefix[fromCoordIdx];
+        const [fromLon, fromLat] = coords[fromCoordIdx];
+        const [toLon, toLat] = coords[m.coordIdx];
+        return {
+          ...m,
+          driveE,
+          driveTimeMin,
+          driveDistanceKm: haversineM(fromLon, fromLat, toLon, toLat) / 1000,
+        };
+      })
+      .filter((m) => m.driveE <= Math.max(0, availableEnergyKwh - minArrivalBuffer));
+
+  const strategicScore = (candidate: CandidateStop) => {
+    const pauseDiff = Math.abs(candidate.driveTimeMin - targetRestMinutes);
+    const pauseScore =
+      candidate.driveTimeMin >= preferredRestMin && candidate.driveTimeMin <= preferredRestMax
+        ? 1.6 - pauseDiff / 45
+        : -Math.max(0, preferredRestMin - candidate.driveTimeMin) / 55 - Math.max(0, candidate.driveTimeMin - preferredRestMax) / 90;
+    const detourPenalty = Math.max(0, candidate.distKm) * 0.65;
+    const powerBonus = Math.min(1.1, Number(candidate.st.powerKw ?? 0) / 180);
+    const progressBonus = Math.min(2.2, candidate.driveDistanceKm / 85);
+    const corridorScore = stationQualityScore(
+      candidate.st,
+      candidate.distKm,
+      candidate.coordIdx / Math.max(1, coords.length - 1),
+    );
+    return pauseScore + progressBonus + powerBonus + corridorScore * 0.12 - detourPenalty;
+  };
+
+  const pickStrategicCandidate = (fromCoordIdx: number, availableEnergyKwh: number) => {
+    const reachable = buildReachableCandidates(fromCoordIdx, availableEnergyKwh);
+    if (reachable.length === 0) return null;
+    const viable = reachable.filter((candidate) => canContinueFrom(candidate.coordIdx));
+    const pool = viable.length > 0 ? viable : reachable;
+    return pool.reduce<CandidateStop | null>((best, candidate) => {
+      if (!best) return candidate;
+      const score = strategicScore(candidate);
+      const bestScore = strategicScore(best);
+      if (score !== bestScore) return score > bestScore ? candidate : best;
+      if (candidate.coordIdx !== best.coordIdx) return candidate.coordIdx > best.coordIdx ? candidate : best;
+      if ((candidate.st.powerKw ?? 0) !== (best.st.powerKw ?? 0)) {
+        return (candidate.st.powerKw ?? 0) > (best.st.powerKw ?? 0) ? candidate : best;
+      }
+      return candidate.distKm < best.distKm ? candidate : best;
+    }, null);
+  };
+
   const stops: StopOut[] = [];
-  let i = 0;
+  let currentCoordIdx = 0;
   let energy = batteryKwh * (startPct / 100);
   let guard = 0;
 
-  while (i < n && guard < n + 20) {
+  while (currentCoordIdx < coords.length - 1 && guard < coords.length + 20) {
     guard += 1;
-    const needToFinish = totalEnergy - prefix[i] + reserve;
+    const needToFinish = totalEnergy - coordEnergyPrefix[currentCoordIdx] + finalReserve;
     if (energy >= needToFinish - minArrivalBuffer) break;
 
-    const reachable = mapped
-      .filter((m) => m.segIdx > i)
-      .map((m) => {
-        const driveE = prefix[m.segIdx] - prefix[i];
-        return { ...m, driveE };
-      })
-      .filter((m) => m.driveE <= Math.max(0, energy - reserve - minArrivalBuffer));
-    if (reachable.length === 0) break;
+    const chosen = pickStrategicCandidate(currentCoordIdx, energy);
+    if (!chosen) break;
 
-    reachable.sort((a, b) => {
-      if (b.segIdx !== a.segIdx) return b.segIdx - a.segIdx;
-      return b.st.powerKw - a.st.powerKw;
-    });
-    const chosen = reachable[0];
-    energy -= chosen.driveE;
-    if (energy < reserve) energy = reserve;
-    const remainingFromHere = totalEnergy - prefix[chosen.segIdx];
-    const targetAtCharge = Math.min(maxCharge, Math.max(minChargeTarget, remainingFromHere + reserve));
-    const charge = Math.max(0, targetAtCharge - energy);
-    if (charge < Math.max(2, batteryKwh * 0.03)) break;
+    energy = Math.max(minArrivalBuffer, energy - chosen.driveE);
+    const remainingFromHere = totalEnergy - coordEnergyPrefix[chosen.coordIdx];
+    const canFinishFromChosen = maxCharge >= remainingFromHere + finalReserve + minArrivalBuffer;
+    let minimumTargetEnergyKwh = canFinishFromChosen
+      ? Math.min(maxCharge, Math.max(remainingFromHere + finalReserve, legReserve + departureBuffer))
+      : maxCharge;
+
+    if (!canFinishFromChosen) {
+      const nextCandidate = pickStrategicCandidate(chosen.coordIdx, maxCharge);
+      if (nextCandidate) {
+        minimumTargetEnergyKwh = Math.min(
+          maxCharge,
+          Math.max(nextCandidate.driveE + minArrivalBuffer, legReserve + departureBuffer),
+        );
+      }
+    }
+
+    const minimumChargeKwh = Math.max(0, minimumTargetEnergyKwh - energy);
     const power = Math.max(20, Math.min(maxChargeKw, chosen.st.powerKw || 50));
-    const mins = (charge / power) * 60;
+    const minsRaw = estimateChargingMinutes(energy, minimumTargetEnergyKwh, batteryKwh, maxChargeKw, power);
+    const mins = Math.max(MIN_REALISTIC_CHARGE_STOP_MIN, minsRaw);
+    const score = stationQualityScore(chosen.st, chosen.distKm, chosen.coordIdx / Math.max(1, coords.length - 1));
+    const batteryPctAfterCharge = clamp((minimumTargetEnergyKwh / batteryKwh) * 100, 0, 100);
     stops.push({
-      segmentIndex: chosen.segIdx,
       lat: chosen.st.latitude,
       lon: chosen.st.longitude,
       station: chosen.st,
+      distKmFromRoute: chosen.distKm,
+      stationScore: score,
       batteryLevelAtCharge: clamp((energy / batteryKwh) * 100, 0, 100),
+      driveTimeFromPreviousStopMin: Math.max(0, chosen.driveTimeMin),
+      driveDistanceFromPreviousStopKm: Math.max(0, chosen.driveDistanceKm),
+      minimumEnergyToCharge: minimumChargeKwh,
+      minimumTargetBatteryPct: batteryPctAfterCharge,
+      minimumChargingTimeMinutes: mins,
+      minimumChargingTimeMinutesRaw: minsRaw,
+      targetBatteryPct: batteryPctAfterCharge,
+      batteryPctAfterCharge,
+      segmentIndex: coordToSegIndex(chosen.coordIdx, displayRanges) + 1,
       chargingTimeMinutes: mins,
-      energyToCharge: charge,
+      chargingTimeMinutesRaw: minsRaw,
+      chargingTimeIsMinimum: minsRaw < MIN_REALISTIC_CHARGE_STOP_MIN,
+      energyToCharge: minimumChargeKwh,
+      estimatedChargeCostEur: minimumChargeKwh * estimateStationPriceEurPerKwh(chosen.st),
     });
-    energy += charge;
-    i = chosen.segIdx;
+    energy = minimumTargetEnergyKwh;
+    currentCoordIdx = chosen.coordIdx;
   }
   return stops;
 }
@@ -525,30 +1197,25 @@ export async function POST(req: NextRequest) {
   if (!body?.start || !body?.end) return NextResponse.json({ detail: "Missing start/end" }, { status: 400 });
 
   try {
+    const requestedBatteryEndPct = Number(body.battery_end_pct ?? 20);
     const startCoord = await resolvePoint(body.start);
     const endCoord = await resolvePoint(body.end);
     let coordsRaw: [number, number][] = [];
+    let routeElevations: number[] = [];
+    let routeAscentM = Number.NaN;
+    let routeDescentM = Number.NaN;
     let orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] } | undefined;
     let orsSteps: OrsStep[] = [];
     let routeSource: "ors" | "synthetic" = "ors";
     try {
-      const routeResp = await withTimeout(
-        fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
-          method: "POST",
-          headers: { Authorization: orsKey(), "Content-Type": "application/json" },
-          body: JSON.stringify({ coordinates: [startCoord, endCoord], instructions: true }),
-          cache: "no-store",
-        }),
-        15000,
-      );
-      if (!routeResp.ok) throw new Error("Route failed");
-      const data = await routeResp.json();
-      const feat = data?.features?.[0];
-      const maybeCoords = feat?.geometry?.coordinates as [number, number][] | undefined;
-      if (!Array.isArray(maybeCoords) || maybeCoords.length < 2) throw new Error("No route geometry");
-      coordsRaw = maybeCoords;
-      orsSeg0 = feat?.properties?.segments?.[0];
-      orsSteps = (Array.isArray(orsSeg0?.steps) ? orsSeg0.steps : []) as OrsStep[];
+      const routeData = await fetchRouteGeometry(startCoord, endCoord);
+      coordsRaw = routeData.coordsRaw;
+      routeElevations = Array.isArray(routeData.elevations) ? routeData.elevations : [];
+      routeAscentM = Number(routeData.ascentM ?? Number.NaN);
+      routeDescentM = Number(routeData.descentM ?? Number.NaN);
+      orsSeg0 = routeData.orsSeg0;
+      orsSteps = routeData.orsSteps;
+      routeSource = routeData.routeSource;
     } catch {
       routeSource = "synthetic";
       coordsRaw = interpolateLineCoords(startCoord, endCoord, 72);
@@ -565,40 +1232,77 @@ export async function POST(req: NextRequest) {
       orsSteps = (orsSeg0.steps ?? []) as OrsStep[];
     }
 
-    const elevations = await fetchElevations(coordsRaw);
+    const elevations =
+      routeSource === "ors"
+        ? routeElevations.length === coordsRaw.length
+          ? routeElevations
+          : await fetchElevations(coordsRaw)
+        : new Array(coordsRaw.length).fill(0);
+    const smoothedElevations = smoothElevations(elevations);
     const weather = await fetchRouteWeather(coordsRaw);
 
     const userMax = clamp(Number(body.user_max_speed ?? 130), 30, 180);
     const profile = body.vehicle_profile ?? {};
     const passengers = Math.max(0, Number(body.num_passengers ?? 1));
     const avgWeight = Math.max(0, Number(body.avg_weight_kg ?? 75));
-    const massKg = Math.max(800, Number(profile.empty_mass ?? 1800)) + Math.max(0, Number(profile.extra_load ?? 0)) + passengers * avgWeight;
-    const cda = Math.max(0.2, Number(profile.drag_coefficient ?? 0.65) * Math.max(1, Number(profile.frontal_area ?? 2.2)));
+    const massKg = Math.max(800, Number(profile.empty_mass ?? 1850)) + Math.max(0, Number(profile.extra_load ?? 0)) + passengers * avgWeight;
+    const rawDrag = Number(profile.drag_coefficient ?? 0.26);
+    const frontalArea = Math.max(1, Number(profile.frontal_area ?? 2.2));
+    const cda =
+      rawDrag > 0.4
+        ? Math.max(0.2, rawDrag)
+        : Math.max(0.2, rawDrag * frontalArea);
     const crr = clamp(Number(profile.rolling_resistance ?? 0.01), 0.004, 0.02);
     const etaDrive = clamp(Number(profile.motor_efficiency ?? 0.9), 0.7, 0.99);
     const regenEff = clamp(Number(profile.regen_efficiency ?? 0.7), 0.3, 0.95);
     const auxBase = Math.max(0.5, Number(profile.aux_power_kw ?? 2));
-    const climateIntensity = body.use_climate ? clamp(Number(body.climate_intensity ?? 0), 0, 100) : 0;
+    const climateEnabled = Boolean(body.use_climate);
+    const climateIntensity = climateEnabled ? clamp(Number(body.climate_intensity ?? 0), 0, 100) : 0;
     const climateBoostKw = (climateIntensity / 100) * 2;
     const comfortTempC = Number(body.comfort_temp_c ?? 20);
-    const rhoAir = clamp(Number(body.rho_air ?? 1.225), 0.9, 1.4);
-    const maxTimePenaltyPct = clamp(Number(body.max_time_penalty_pct ?? 12), 0, 40);
+    const rhoAirReference = clamp(Number(process.env.DEFAULT_RHO_AIR_REF ?? 1.225), 0.9, 1.4);
+    const rhoAirInput = Number(body.rho_air);
+    const hasFixedRhoAir = Number.isFinite(rhoAirInput);
+    const fixedRhoAir = hasFixedRhoAir ? clamp(rhoAirInput, 0.9, 1.4) : rhoAirReference;
+    const maxTimePenaltyPct = clamp(Number(body.max_time_penalty_pct ?? 15), 0, 40);
     const priceEurPerKwh = Math.max(0, Number(body.electricity_price_eur_kwh ?? 0.25));
     const batteryKwh = Math.max(20, Number(profile.battery_kwh ?? 60));
     const maxChargeKw = Math.max(50, Number(profile.max_charge_kw ?? 150));
+    const regenMaxKw = Math.max(20, Number(process.env.DEFAULT_REGEN_MAX_KW ?? 70));
     const edgeCount = Math.max(0, coordsRaw.length - 1);
     const edgeGeom = new Array(edgeCount).fill(null).map((_, edge) => {
       const [lon1, lat1] = coordsRaw[edge];
       const [lon2, lat2] = coordsRaw[edge + 1];
       const d = haversineM(lon1, lat1, lon2, lat2);
-      const slope = d > 0 ? ((elevations[edge + 1] ?? 0) - (elevations[edge] ?? 0)) / d : 0;
+      const slope = d > 0 ? ((smoothedElevations[edge + 1] ?? 0) - (smoothedElevations[edge] ?? 0)) / d : 0;
       return {
         distanceM: d,
         slope,
         tempC: weather.edgeTemp[edge] ?? 20,
         rain: weather.edgeRain[edge] ?? 0,
+        windMs: weather.edgeWindMs[edge] ?? 0,
+        headwindMs: weather.edgeHeadwindMs[edge] ?? 0,
       };
     });
+    const rawElevationGainM = edgeGeom.reduce((sum, g, edge) => {
+      const delta = (smoothedElevations[edge + 1] ?? 0) - (smoothedElevations[edge] ?? 0);
+      return sum + Math.max(0, delta);
+    }, 0);
+    const rawElevationLossM = edgeGeom.reduce((sum, g, edge) => {
+      const delta = (smoothedElevations[edge + 1] ?? 0) - (smoothedElevations[edge] ?? 0);
+      return sum + Math.max(0, -delta);
+    }, 0);
+    const elevationGainM = routeSource === "ors" && Number.isFinite(routeAscentM) ? routeAscentM : rawElevationGainM;
+    const elevationLossM = routeSource === "ors" && Number.isFinite(routeDescentM) ? routeDescentM : rawElevationLossM;
+    const maxGradePct =
+      edgeGeom.length > 0
+        ? Math.max(
+            ...edgeGeom.map((g) => {
+              if ((g.distanceM ?? 0) < 50) return 0;
+              return Math.min(12, Math.abs((g.slope ?? 0) * 100));
+            }),
+          )
+        : 0;
 
     const edgeEnergy = (edge: number, speed: number) => {
       const g = edgeGeom[edge];
@@ -606,12 +1310,14 @@ export async function POST(req: NextRequest) {
       const veh = {
         massKg,
         cda,
-        crr: crr * rainDensityToCrrMultiplier(g.rain),
-        rhoAir: airDensityFromTempC(g.tempC, rhoAir),
+        crr: crr * rainDensityToCrrMultiplier(g.rain) * rollingResistanceTempMultiplier(g.tempC),
+        rhoAir: hasFixedRhoAir ? fixedRhoAir : airDensityFromTempC(g.tempC, rhoAirReference),
         etaDrive,
         regenEff,
-        auxPowerKw: auxBase + climateBoostKw + hvacPowerFromTemp(g.tempC, comfortTempC),
+          auxPowerKw: auxBase + climateBoostKw + cabinClimateAuxKw(g.tempC, comfortTempC, climateEnabled),
         batteryKwh,
+        windHeadMs: g.headwindMs,
+        regenMaxKw,
       };
       const out = segEnergyAndTime(g.distanceM, g.slope, speed, veh);
       return { energyKwh: out.energyWh / 1000, timeH: out.timeH };
@@ -627,15 +1333,18 @@ export async function POST(req: NextRequest) {
         const slope = g?.slope ?? 0;
         const tempC = g?.tempC ?? 20;
         const rain = g?.rain ?? 0;
+        const headwindMs = g?.headwindMs ?? 0;
         const veh = {
           massKg,
           cda,
-          crr: crr * rainDensityToCrrMultiplier(rain),
-          rhoAir: airDensityFromTempC(tempC, rhoAir),
+          crr: crr * rainDensityToCrrMultiplier(rain) * rollingResistanceTempMultiplier(tempC),
+          rhoAir: hasFixedRhoAir ? fixedRhoAir : airDensityFromTempC(tempC, rhoAirReference),
           etaDrive,
           regenEff,
-          auxPowerKw: auxBase + climateBoostKw + hvacPowerFromTemp(tempC, comfortTempC),
+          auxPowerKw: auxBase + climateBoostKw + cabinClimateAuxKw(tempC, comfortTempC, climateEnabled),
           batteryKwh,
+          windHeadMs: headwindMs,
+          regenMaxKw,
         };
         const out = segEnergyAndTime(d, slope, speed, veh);
         distM += d; wh += out.energyWh; timeH += out.timeH; tW += tempC * d; rW += rain * d;
@@ -643,57 +1352,114 @@ export async function POST(req: NextRequest) {
       return { distM, wh, timeH, avgTemp: distM > 0 ? tW / distM : 20, avgRain: distM > 0 ? rW / distM : 0 };
     };
 
-    const segments: SegmentOut[] = [];
-    const ranges: Array<{ from: number; to: number }> = [];
+    const evaluateRangeCandidate = (from: number, to: number, speed: number): PlanningSegmentCandidate | null => {
+      if (to <= from || from < 0 || to >= coordsRaw.length) return null;
+      const edgeEnergyKwh: number[] = [];
+      const edgeTimeMin: number[] = [];
+      let distM = 0;
+      let totalEnergyKwh = 0;
+      let totalTimeMin = 0;
+      let tempWeighted = 0;
+      let rainWeighted = 0;
+      for (let coordIdx = from + 1; coordIdx <= to; coordIdx += 1) {
+        const edgeIdx = coordIdx - 1;
+        const g = edgeGeom[edgeIdx];
+        const d = g?.distanceM ?? 0;
+        if (d <= 0) {
+          edgeEnergyKwh.push(0);
+          edgeTimeMin.push(0);
+          continue;
+        }
+        const out = edgeEnergy(edgeIdx, speed);
+        const energyKwh = out.energyKwh;
+        const timeMin = out.timeH * 60;
+        edgeEnergyKwh.push(energyKwh);
+        edgeTimeMin.push(timeMin);
+        distM += d;
+        totalEnergyKwh += energyKwh;
+        totalTimeMin += timeMin;
+        tempWeighted += (g?.tempC ?? 20) * d;
+        rainWeighted += (g?.rain ?? 0) * d;
+      }
+      if (distM <= 0) return null;
+      return {
+        speed,
+        energyKwh: totalEnergyKwh,
+        timeMin: totalTimeMin,
+        avgTemp: tempWeighted / distM,
+        avgRain: rainWeighted / distM,
+        edgeEnergyKwh,
+        edgeTimeMin,
+      };
+    };
+
+    const buildSegmentOut = (base: PlanningSegmentBase, candidate: PlanningSegmentCandidate, index: number): SegmentOut => ({
+      idx: index + 1,
+      index: index + 1,
+      lat_start: base.lat_start,
+      lon_start: base.lon_start,
+      lat_end: base.lat_end,
+      lon_end: base.lon_end,
+      distance_m: base.distance_m,
+      distance: base.distance_m,
+      distance_km: base.distance_m / 1000,
+      distanceKm: base.distance_m / 1000,
+      way_type: base.way_type,
+      speed_limit: base.speed_limit,
+      speedLimit: base.speed_limit,
+      eco_speed: Number(candidate.speed.toFixed(1)),
+      ecoSpeed: Number(candidate.speed.toFixed(1)),
+      eco_energy: candidate.energyKwh,
+      ecoEnergy: candidate.energyKwh,
+      real_energy: candidate.energyKwh,
+      limit_energy: base.limitEnergyKwh,
+      limitEnergy: base.limitEnergyKwh,
+      eco_cost_eur: candidate.energyKwh * priceEurPerKwh,
+      limit_cost_eur: base.limitEnergyKwh * priceEurPerKwh,
+      eco_time: candidate.timeMin * 60,
+      real_time: candidate.timeMin * 60,
+      limit_time: base.limitTimeMin * 60,
+      eco_time_min: candidate.timeMin,
+      ecoTimeMin: candidate.timeMin,
+      limit_time_min: base.limitTimeMin,
+      limitTimeMin: base.limitTimeMin,
+      temp_c_avg: candidate.avgTemp,
+      rain_mmh_avg: candidate.avgRain,
+      duration: candidate.timeMin * 60,
+    });
+
+    const planningBases: PlanningSegmentBase[] = [];
+    const planningRanges: RouteRange[] = [];
     const addSeg = (from: number, to: number, step?: OrsStep) => {
       if (to <= from || from < 0 || to >= coordsRaw.length) return;
-      const base = evalRange(from, to, 50);
-      if (base.distM <= 0) return;
-      const legal = legalLimitFromStep(step, userMax, base.distM);
+      const probe = evalRange(from, to, 50);
+      if (probe.distM <= 0) return;
+      const legal = legalLimitFromStep(step, userMax, probe.distM);
       let speedLimit = Math.min(legal, maneuverCap(step?.type, step?.instruction));
       speedLimit = snapToFrenchLegalLimit(clamp(speedLimit, 20, userMax), userMax);
       const limitScenario = speedLimit >= 110 ? Math.min(speedLimit, 130) : speedLimit;
-      const ecoScenario = speedLimit >= 110 ? 110 : Math.max(20, speedLimit - 20);
-      const ref = evalRange(from, to, limitScenario);
-      const ecoRef = evalRange(from, to, ecoScenario);
-      const maxAllowed = ref.timeH * (1 + maxTimePenaltyPct / 100);
-      const best = ecoRef.timeH <= maxAllowed + 1e-9 ? { v: ecoScenario, ...ecoRef } : { v: ecoScenario, ...ecoRef };
-      const eco = best.wh / 1000, lim = ref.wh / 1000;
-      segments.push({
-        idx: segments.length + 1,
-        index: segments.length + 1,
+      const candidates = buildEcoSpeedCandidates(limitScenario)
+        .map((speed) => evaluateRangeCandidate(from, to, speed))
+        .filter((candidate): candidate is PlanningSegmentCandidate => candidate !== null);
+      if (candidates.length === 0) return;
+      const limitCandidate = candidates[0];
+      planningBases.push({
+        from,
+        to,
         lat_start: coordsRaw[from][1],
         lon_start: coordsRaw[from][0],
         lat_end: coordsRaw[to][1],
         lon_end: coordsRaw[to][0],
-        distance_m: best.distM,
-        distance: best.distM,
-        distance_km: best.distM / 1000,
-        distanceKm: best.distM / 1000,
+        distance_m: probe.distM,
         way_type: guessWayType(limitScenario),
         speed_limit: limitScenario,
-        speedLimit: limitScenario,
-        eco_speed: Number(best.v.toFixed(1)),
-        ecoSpeed: Number(best.v.toFixed(1)),
-        eco_energy: eco,
-        ecoEnergy: eco,
-        real_energy: lim,
-        limit_energy: lim,
-        limitEnergy: lim,
-        eco_cost_eur: eco * priceEurPerKwh,
-        limit_cost_eur: lim * priceEurPerKwh,
-        eco_time: best.timeH * 3600,
-        real_time: ref.timeH * 3600,
-        limit_time: ref.timeH * 3600,
-        eco_time_min: best.timeH * 60,
-        ecoTimeMin: best.timeH * 60,
-        limit_time_min: ref.timeH * 60,
-        limitTimeMin: ref.timeH * 60,
-        temp_c_avg: best.avgTemp,
-        rain_mmh_avg: best.avgRain,
-        duration: best.timeH * 3600,
+        avgTemp: limitCandidate.avgTemp,
+        avgRain: limitCandidate.avgRain,
+        limitEnergyKwh: limitCandidate.energyKwh,
+        limitTimeMin: limitCandidate.timeMin,
+        candidates,
       });
-      ranges.push({ from, to });
+      planningRanges.push({ from, to });
     };
 
     if (orsSteps.length > 0) {
@@ -708,73 +1474,222 @@ export async function POST(req: NextRequest) {
       for (let s = 0; s < segCount; s += chunk) addSeg(s, Math.min(segCount, s + chunk));
     }
 
-    const totalDistance = Number(orsSeg0?.distance ?? segments.reduce((s, seg) => s + seg.distance_m, 0));
-    const totalDuration = Number(orsSeg0?.duration ?? segments.reduce((s, seg) => s + seg.duration, 0));
-    const totalDistanceKm = totalDistance / 1000;
-    const totalEcoEnergy = segments.reduce((s, seg) => s + seg.eco_energy, 0);
-    const totalLimitEnergy = segments.reduce((s, seg) => s + seg.limit_energy, 0);
-    const totalEcoTimeMin = segments.reduce((s, seg) => s + seg.eco_time_min, 0);
-    const totalLimitTimeMin = segments.reduce((s, seg) => s + seg.limit_time_min, 0);
-    const totalEcoCostEur = totalEcoEnergy * priceEurPerKwh;
-    const totalLimitCostEur = totalLimitEnergy * priceEurPerKwh;
-
-    const batteryStartPct = Number(body.battery_start_pct ?? 100);
-    const batteryEndPct = Number(body.battery_end_pct ?? 20);
+    const batteryStartPct = clamp(Number(body.battery_start_pct ?? 100), 5, 100);
+    const batteryEndPct = clamp(requestedBatteryEndPct, 10, 80);
+    const warnings: string[] = [];
+    if (requestedBatteryEndPct < 10) {
+      warnings.push("La batterie d'arrivee a ete relevee a 10% minimum pour garder une marge de securite realiste.");
+    }
+    if (routeSource !== "ors") {
+      warnings.push("Le calcul d'itineraire detaille n'etait pas disponible. Un trace de secours a ete utilise, avec une precision de recharge plus faible.");
+    }
     const startKwh = batteryKwh * (batteryStartPct / 100);
     const targetArrivalKwh = batteryKwh * (batteryEndPct / 100);
-    const rechargeNeededEcoKwh = Math.max(0, totalEcoEnergy - (startKwh - targetArrivalKwh));
-    const rechargeNeededLimitKwh = Math.max(0, totalLimitEnergy - (startKwh - targetArrivalKwh));
-    const co2AvoidedKg = Math.max(0, (totalLimitEnergy - totalEcoEnergy) * 0.5);
-    const avgTemp = segments.length ? segments.reduce((s, seg) => s + seg.temp_c_avg, 0) / segments.length : 20;
-    const avgRain = segments.length ? segments.reduce((s, seg) => s + seg.rain_mmh_avg, 0) / segments.length : 0;
-    const rechargeCostEcoEur = rechargeNeededEcoKwh * priceEurPerKwh;
-    const rechargeCostLimitEur = rechargeNeededLimitKwh * priceEurPerKwh;
-    const totalEcoTripCostWithRechargeEur = totalEcoCostEur + rechargeCostEcoEur;
-    const totalLimitTripCostWithRechargeEur = totalLimitCostEur + rechargeCostLimitEur;
+    const stations = await getStationsCached();
+    const mappedStations = mapStationsToRoute(stations, coordsRaw);
 
-    let stations: ChargingStation[] = FALLBACK_STATIONS;
-    try {
-      const live = await withTimeout(fetchOpenChargeMapStations(), 8000);
-      if (live.length > 0) stations = live;
-    } catch {}
-    const ecoStops = planChargingStops("eco_energy", segments, coordsRaw, ranges, stations, batteryKwh, batteryStartPct, batteryEndPct, maxChargeKw);
-    const limitStops = planChargingStops("limit_energy", segments, coordsRaw, ranges, stations, batteryKwh, batteryStartPct, batteryEndPct, maxChargeKw);
-    const preconditioningEcoKwh = ecoStops.reduce((sum, stop) => {
-      const seg = segments[Math.max(0, Math.min(segments.length - 1, stop.segmentIndex))];
-      const kw = batteryPreconditioningKw(seg?.temp_c_avg ?? avgTemp);
-      return sum + kw * (20 / 60);
-    }, 0);
-    const preconditioningLimitKwh = limitStops.reduce((sum, stop) => {
-      const seg = segments[Math.max(0, Math.min(segments.length - 1, stop.segmentIndex))];
-      const kw = batteryPreconditioningKw(seg?.temp_c_avg ?? avgTemp);
-      return sum + kw * (20 / 60);
-    }, 0);
-    const preconditioningCostEcoEur = preconditioningEcoKwh * priceEurPerKwh;
-    const preconditioningCostLimitEur = preconditioningLimitKwh * priceEurPerKwh;
-    const edgeToSegment = new Array(Math.max(0, coordsRaw.length - 1)).fill(-1);
-    for (let s = 0; s < ranges.length; s += 1) {
-      for (let e = ranges[s].from; e < ranges[s].to; e += 1) {
-        if (e >= 0 && e < edgeToSegment.length) edgeToSegment[e] = s;
+    const buildExactProfile = (choiceIndices: number[]) => {
+      const edgeEnergyKwh = new Array(edgeCount).fill(0);
+      const edgeTimeMin = new Array(edgeCount).fill(0);
+      const edgeSpeedKmh = new Array(edgeCount).fill(0);
+      for (let segmentIdx = 0; segmentIdx < planningBases.length; segmentIdx += 1) {
+        const base = planningBases[segmentIdx];
+        const candidate =
+          base.candidates[Math.max(0, Math.min(choiceIndices[segmentIdx] ?? 0, base.candidates.length - 1))] ?? base.candidates[0];
+        for (let localEdgeIdx = 0; localEdgeIdx < candidate.edgeEnergyKwh.length; localEdgeIdx += 1) {
+          const edgeIdx = base.from + localEdgeIdx;
+          if (edgeIdx < 0 || edgeIdx >= edgeCount) continue;
+          edgeEnergyKwh[edgeIdx] = candidate.edgeEnergyKwh[localEdgeIdx];
+          edgeTimeMin[edgeIdx] = candidate.edgeTimeMin[localEdgeIdx];
+          edgeSpeedKmh[edgeIdx] = candidate.speed;
+        }
       }
+      const coordEnergyPrefix = new Array(coordsRaw.length).fill(0);
+      const coordTimePrefix = new Array(coordsRaw.length).fill(0);
+      for (let coordIdx = 1; coordIdx < coordsRaw.length; coordIdx += 1) {
+        coordEnergyPrefix[coordIdx] = coordEnergyPrefix[coordIdx - 1] + Number(edgeEnergyKwh[coordIdx - 1] ?? 0);
+        coordTimePrefix[coordIdx] = coordTimePrefix[coordIdx - 1] + Number(edgeTimeMin[coordIdx - 1] ?? 0);
+      }
+      return { edgeEnergyKwh, edgeTimeMin, edgeSpeedKmh, coordEnergyPrefix, coordTimePrefix };
+    };
+
+    const evaluateProfile = (choiceIndices: number[]) => {
+      const planningSegments = planningBases.map((base, index) =>
+        buildSegmentOut(
+          base,
+          base.candidates[Math.max(0, Math.min(choiceIndices[index] ?? 0, base.candidates.length - 1))] ?? base.candidates[0],
+          index,
+        ),
+      );
+      const normalized = normalizeSegments(
+        planningSegments.map((segment) => ({ ...segment })),
+        planningRanges.map((range) => ({ ...range })),
+      );
+      const exact = buildExactProfile(choiceIndices);
+      const chargingStops = planChargingStops(
+        mappedStations,
+        coordsRaw,
+        normalized.ranges,
+        exact.coordEnergyPrefix,
+        exact.coordTimePrefix,
+        batteryKwh,
+        batteryStartPct,
+        batteryEndPct,
+        maxChargeKw,
+      );
+      const totalEnergyKwh = exact.coordEnergyPrefix[exact.coordEnergyPrefix.length - 1] ?? 0;
+      const totalDriveTimeMin = exact.coordTimePrefix[exact.coordTimePrefix.length - 1] ?? 0;
+      const totalCostEur = totalEnergyKwh * priceEurPerKwh;
+      const rechargeNeededKwh = Math.max(0, totalEnergyKwh - (startKwh - targetArrivalKwh));
+      const totalStopEnergyKwh = chargingStops.reduce((sum, stop) => sum + Number(stop.energyToCharge ?? 0), 0);
+      const unmetRechargeKwh = Math.max(0, rechargeNeededKwh - totalStopEnergyKwh);
+      const rechargeCostFromStopsEur = chargingStops.reduce(
+        (sum, stop) => sum + Number(stop.estimatedChargeCostEur ?? stop.energyToCharge * priceEurPerKwh),
+        0,
+      );
+      const rechargeCostEur = rechargeCostFromStopsEur + unmetRechargeKwh * priceEurPerKwh;
+      const totalChargeTimeMin = chargingStops.reduce((sum, stop) => sum + Number(stop.chargingTimeMinutes ?? 0), 0);
+      const avgTemp =
+        normalized.segments.length > 0
+          ? normalized.segments.reduce((sum, segment) => sum + Number(segment.temp_c_avg ?? 0), 0) / normalized.segments.length
+          : 20;
+      const preconditioning = chargingStops.reduce(
+        (acc, stop) => {
+          const segment = normalized.segments[Math.max(0, Math.min(normalized.segments.length - 1, stop.segmentIndex - 1))];
+          const kw = batteryPreconditioningKw(segment?.temp_c_avg ?? avgTemp);
+          if (kw <= 0) return acc;
+          return { kwh: acc.kwh + kw * (20 / 60), timeMin: acc.timeMin + 20 };
+        },
+        { kwh: 0, timeMin: 0 },
+      );
+      const preconditioningCostEur = preconditioning.kwh * priceEurPerKwh;
+      const totalTripCostWithRechargeEur = totalCostEur + rechargeCostEur;
+      const totalTripCostWithRechargeAndPreconditioningEur = totalTripCostWithRechargeEur + preconditioningCostEur;
+      return {
+        segments: normalized.segments,
+        ranges: normalized.ranges,
+        chargingStops,
+        edgeEnergyKwh: exact.edgeEnergyKwh,
+        edgeTimeMin: exact.edgeTimeMin,
+        edgeSpeedKmh: exact.edgeSpeedKmh,
+        totalEnergyKwh,
+        totalDriveTimeMin,
+        totalChargeTimeMin,
+        totalPreconditioningTimeMin: preconditioning.timeMin,
+        totalTimeMin: totalDriveTimeMin + totalChargeTimeMin + preconditioning.timeMin,
+        totalCostEur,
+        rechargeNeededKwh,
+        totalStopEnergyKwh,
+        unmetRechargeKwh,
+        rechargeCostEur,
+        preconditioningEnergyKwh: preconditioning.kwh,
+        preconditioningCostEur,
+        totalTripCostWithRechargeEur,
+        totalTripCostWithRechargeAndPreconditioningEur,
+      };
+    };
+
+    const limitChoiceIndices = planningBases.map(() => 0);
+    const limitEval = evaluateProfile(limitChoiceIndices);
+    const allowedEcoTotalTimeMin = limitEval.totalTimeMin * (1 + maxTimePenaltyPct / 100);
+    const maxMoves = planningBases.reduce((sum, base) => sum + Math.max(0, base.candidates.length - 1), 0);
+    let ecoChoiceIndices = [...limitChoiceIndices];
+    let ecoEval = limitEval;
+    let optimizerMoves = 0;
+    let optimizerEvaluations = 0;
+
+    for (let move = 0; move < maxMoves; move += 1) {
+      let bestMove: { choiceIndices: number[]; evaluation: ReturnType<typeof evaluateProfile> } | null = null;
+      for (let segmentIdx = 0; segmentIdx < planningBases.length; segmentIdx += 1) {
+        const currentCandidateIdx = ecoChoiceIndices[segmentIdx] ?? 0;
+        for (let candidateIdx = currentCandidateIdx + 1; candidateIdx < planningBases[segmentIdx].candidates.length; candidateIdx += 1) {
+          const nextChoiceIndices = [...ecoChoiceIndices];
+          nextChoiceIndices[segmentIdx] = candidateIdx;
+          const nextEvaluation = evaluateProfile(nextChoiceIndices);
+          optimizerEvaluations += 1;
+          if (nextEvaluation.totalTimeMin > allowedEcoTotalTimeMin + 1e-6) continue;
+          if (nextEvaluation.totalEnergyKwh >= ecoEval.totalEnergyKwh - 1e-6) continue;
+          const isBetter =
+            !bestMove ||
+            nextEvaluation.totalEnergyKwh < bestMove.evaluation.totalEnergyKwh - 1e-6 ||
+            (Math.abs(nextEvaluation.totalEnergyKwh - bestMove.evaluation.totalEnergyKwh) <= 1e-6 &&
+              (nextEvaluation.totalTimeMin < bestMove.evaluation.totalTimeMin - 1e-6 ||
+                (Math.abs(nextEvaluation.totalTimeMin - bestMove.evaluation.totalTimeMin) <= 1e-6 &&
+                  nextEvaluation.chargingStops.length < bestMove.evaluation.chargingStops.length)));
+          if (isBetter) {
+            bestMove = { choiceIndices: nextChoiceIndices, evaluation: nextEvaluation };
+          }
+        }
+      }
+      if (!bestMove) break;
+      ecoChoiceIndices = bestMove.choiceIndices;
+      ecoEval = bestMove.evaluation;
+      optimizerMoves += 1;
     }
+
+    const segments = ecoEval.segments;
+    const totalDistance = Number(orsSeg0?.distance ?? segments.reduce((sum, segment) => sum + segment.distance_m, 0));
+    const totalDuration = Number(orsSeg0?.duration ?? segments.reduce((sum, segment) => sum + segment.duration, 0));
+    const totalDistanceKm = totalDistance / 1000;
+    const totalEcoEnergy = ecoEval.totalEnergyKwh;
+    const totalLimitEnergy = limitEval.totalEnergyKwh;
+    const totalEcoDriveTimeMin = ecoEval.totalDriveTimeMin;
+    const totalLimitDriveTimeMin = limitEval.totalDriveTimeMin;
+    const totalEcoCostEur = ecoEval.totalCostEur;
+    const totalLimitCostEur = limitEval.totalCostEur;
+    const rechargeNeededEcoKwh = ecoEval.rechargeNeededKwh;
+    const rechargeNeededLimitKwh = limitEval.rechargeNeededKwh;
+    const totalEcoStopEnergyKwh = ecoEval.totalStopEnergyKwh;
+    const totalLimitStopEnergyKwh = limitEval.totalStopEnergyKwh;
+    const unmetEcoRechargeKwh = ecoEval.unmetRechargeKwh;
+    const unmetLimitRechargeKwh = limitEval.unmetRechargeKwh;
+    const rechargeCostEcoEur = ecoEval.rechargeCostEur;
+    const rechargeCostLimitEur = limitEval.rechargeCostEur;
+    const ecoStops = ecoEval.chargingStops;
+    const limitStops = limitEval.chargingStops;
+    if (unmetEcoRechargeKwh > 0.5) {
+      warnings.push(
+        `Le plan de recharge eco couvre ${totalEcoStopEnergyKwh.toFixed(1)} kWh sur ${rechargeNeededEcoKwh.toFixed(1)} kWh necessaires.`,
+      );
+    }
+    if (unmetLimitRechargeKwh > 0.5) {
+      warnings.push(
+        `Le plan de recharge limite couvre ${totalLimitStopEnergyKwh.toFixed(1)} kWh sur ${rechargeNeededLimitKwh.toFixed(1)} kWh necessaires.`,
+      );
+    }
+    const totalEcoTripCostWithRechargeEur = ecoEval.totalTripCostWithRechargeEur;
+    const totalLimitTripCostWithRechargeEur = limitEval.totalTripCostWithRechargeEur;
+    const totalEcoChargeTimeMin = ecoEval.totalChargeTimeMin;
+    const totalLimitChargeTimeMin = limitEval.totalChargeTimeMin;
+    const preconditioningEcoKwh = ecoEval.preconditioningEnergyKwh;
+    const preconditioningLimitKwh = limitEval.preconditioningEnergyKwh;
+    const preconditioningCostEcoEur = ecoEval.preconditioningCostEur;
+    const preconditioningCostLimitEur = limitEval.preconditioningCostEur;
+    const totalEcoPreconditioningTimeMin = ecoEval.totalPreconditioningTimeMin;
+    const totalLimitPreconditioningTimeMin = limitEval.totalPreconditioningTimeMin;
+    const totalEcoTimeMin = ecoEval.totalTimeMin;
+    const totalLimitTimeMin = limitEval.totalTimeMin;
+    const gridCo2KgPerKwh = clamp(Number(process.env.DEFAULT_GRID_CO2_KG_PER_KWH ?? CO2_FRANCE_KG_PER_KWH), 0.01, 1.2);
+    const co2AvoidedKg = Math.max(0, (totalLimitEnergy - totalEcoEnergy) * gridCo2KgPerKwh);
+    const avgTemp = segments.length ? segments.reduce((sum, segment) => sum + segment.temp_c_avg, 0) / segments.length : 20;
+    const avgRain = segments.length ? segments.reduce((sum, segment) => sum + segment.rain_mmh_avg, 0) / segments.length : 0;
     const weatherProfile: WeatherEdgeOut[] = edgeGeom.map((g, edgeIdx) => {
-      const segPos = edgeToSegment[edgeIdx] >= 0 ? edgeToSegment[edgeIdx] : 0;
-      const seg = segments[Math.min(segPos, Math.max(0, segments.length - 1))];
-      const ecoSpeed = Math.max(20, Number(seg?.eco_speed ?? seg?.speed_limit ?? 50));
-      const limSpeed = Math.max(20, Number(seg?.speed_limit ?? 50));
-      const ecoOut = edgeEnergy(edgeIdx, ecoSpeed);
-      const limOut = edgeEnergy(edgeIdx, limSpeed);
+      const ecoSpeed = Math.max(20, Number(ecoEval.edgeSpeedKmh[edgeIdx] ?? 50));
+      const limSpeed = Math.max(20, Number(limitEval.edgeSpeedKmh[edgeIdx] ?? ecoSpeed));
       return {
         edge_index: edgeIdx,
         distance_km: (g.distanceM ?? 0) / 1000,
         temp_c: g.tempC,
         rain_mmh: g.rain,
+        wind_kmh: (g.windMs ?? 0) * 3.6,
+        headwind_ms: g.headwindMs ?? 0,
         rain_crr_multiplier: rainDensityToCrrMultiplier(g.rain),
-        hvac_kw: auxBase + climateBoostKw + hvacPowerFromTemp(g.tempC, comfortTempC),
+        hvac_kw: auxBase + climateBoostKw + cabinClimateAuxKw(g.tempC, comfortTempC, climateEnabled),
         eco_speed_kmh: ecoSpeed,
         limit_speed_kmh: limSpeed,
-        eco_energy_kwh: ecoOut.energyKwh,
-        limit_energy_kwh: limOut.energyKwh,
+        eco_energy_kwh: Number(ecoEval.edgeEnergyKwh[edgeIdx] ?? 0),
+        limit_energy_kwh: Number(limitEval.edgeEnergyKwh[edgeIdx] ?? 0),
+        eco_time_min: Number(ecoEval.edgeTimeMin[edgeIdx] ?? 0),
       };
     });
     const nearbyStations = listStationsNearRoute(stations, coordsRaw, 20, 260);
@@ -793,24 +1708,28 @@ export async function POST(req: NextRequest) {
     const rainDistanceKm = rainPoints.reduce((sum, w) => sum + w.distance_km, 0);
     const tempMinC = weatherProfile.length > 0 ? Math.min(...weatherProfile.map((w) => w.temp_c)) : avgTemp;
     const tempMaxC = weatherProfile.length > 0 ? Math.max(...weatherProfile.map((w) => w.temp_c)) : avgTemp;
+    const windAvgKmh =
+      weatherProfile.length > 0 ? weatherProfile.reduce((sum, w) => sum + Number(w.wind_kmh ?? 0), 0) / weatherProfile.length : 0;
+    const headwindAvgMs =
+      weatherProfile.length > 0 ? weatherProfile.reduce((sum, w) => sum + Number(w.headwind_ms ?? 0), 0) / weatherProfile.length : 0;
     let ecoNeutralEnergyKwh = 0;
     let limitNeutralEnergyKwh = 0;
     for (let edgeIdx = 0; edgeIdx < edgeGeom.length; edgeIdx += 1) {
-      const segPos = edgeToSegment[edgeIdx] >= 0 ? edgeToSegment[edgeIdx] : 0;
-      const seg = segments[Math.min(segPos, Math.max(0, segments.length - 1))];
-      const ecoSpeed = Math.max(20, Number(seg?.eco_speed ?? seg?.speed_limit ?? 50));
-      const limSpeed = Math.max(20, Number(seg?.speed_limit ?? 50));
+      const ecoSpeed = Math.max(20, Number(ecoEval.edgeSpeedKmh[edgeIdx] ?? 50));
+      const limSpeed = Math.max(20, Number(limitEval.edgeSpeedKmh[edgeIdx] ?? ecoSpeed));
       const g = edgeGeom[edgeIdx];
       if (!g || g.distanceM <= 0) continue;
       const neutralVeh = {
         massKg,
         cda,
-        crr,
-        rhoAir: airDensityFromTempC(comfortTempC, rhoAir),
+        crr: crr * rollingResistanceTempMultiplier(comfortTempC),
+        rhoAir: hasFixedRhoAir ? fixedRhoAir : airDensityFromTempC(comfortTempC, rhoAirReference),
         etaDrive,
         regenEff,
-        auxPowerKw: auxBase + climateBoostKw + hvacPowerFromTemp(comfortTempC, comfortTempC),
+        auxPowerKw: auxBase + climateBoostKw + cabinClimateAuxKw(comfortTempC, comfortTempC, climateEnabled),
         batteryKwh,
+        windHeadMs: 0,
+        regenMaxKw,
       };
       ecoNeutralEnergyKwh += segEnergyAndTime(g.distanceM, g.slope, ecoSpeed, neutralVeh).energyWh / 1000;
       limitNeutralEnergyKwh += segEnergyAndTime(g.distanceM, g.slope, limSpeed, neutralVeh).energyWh / 1000;
@@ -831,16 +1750,39 @@ export async function POST(req: NextRequest) {
     const tollCostEur = motorwayDistanceKm * tollRateMotorwayEurPerKm;
     const totalEcoTripCostAllEur = totalEcoTripCostWithRechargeAndPrecondEur + tollCostEur;
     const totalLimitTripCostAllEur = totalLimitTripCostWithRechargeAndPrecondEur + tollCostEur;
-    const routeRoadmap = ecoStops.map((s, i) => ({
-      stop_number: i + 1,
-      segment_index: s.segmentIndex,
-      station_name: s.station.name,
-      station_power_kw: s.station.powerKw,
-      charge_energy_kwh: s.energyToCharge,
-      charge_time_min: s.chargingTimeMinutes,
-      preconditioning_min: 20,
-      preconditioning_kw: batteryPreconditioningKw(segments[Math.max(0, Math.min(segments.length - 1, s.segmentIndex))]?.temp_c_avg ?? avgTemp),
-    }));
+    const routeRoadmap = ecoStops.map((s, i) => {
+      const preconditioningKw = batteryPreconditioningKw(
+        segments[Math.max(0, Math.min(segments.length - 1, s.segmentIndex - 1))]?.temp_c_avg ?? avgTemp,
+      );
+      const preconditioningMin = preconditioningKw > 0 ? 20 : 0;
+      return {
+        stop_number: i + 1,
+        segment_index: s.segmentIndex,
+        station_name: s.station.name,
+        station_operator: s.station.operator,
+        station_status: s.station.status,
+        station_address: s.station.address,
+        station_power_kw: s.station.powerKw,
+        station_price_eur_kwh: estimateStationPriceEurPerKwh(s.station),
+        detour_from_route_km: s.distKmFromRoute,
+        station_score: s.stationScore,
+        battery_pct_before_charge: s.batteryLevelAtCharge,
+        drive_time_from_previous_stop_min: s.driveTimeFromPreviousStopMin,
+        drive_distance_from_previous_stop_km: s.driveDistanceFromPreviousStopKm,
+        minimum_charge_energy_kwh: s.minimumEnergyToCharge,
+        minimum_battery_pct_after_charge: s.minimumTargetBatteryPct,
+        minimum_charge_time_min: s.minimumChargingTimeMinutes,
+        minimum_charge_time_min_raw: s.minimumChargingTimeMinutesRaw,
+        battery_pct_after_charge: s.batteryPctAfterCharge,
+        charge_energy_kwh: s.energyToCharge,
+        charge_time_min: s.chargingTimeMinutes,
+        charge_time_min_raw: s.chargingTimeMinutesRaw,
+        charge_time_minimum_applied: Boolean(s.chargingTimeIsMinimum),
+        charge_cost_eur: s.estimatedChargeCostEur,
+        preconditioning_min: preconditioningMin,
+        preconditioning_kw: preconditioningKw,
+      };
+    });
     const segmentLogbook = segments.map((seg) => ({
       id_segment: seg.idx,
       distance_km: seg.distance_km,
@@ -877,6 +1819,12 @@ export async function POST(req: NextRequest) {
       totalEcoTimeMin: totalEcoTimeMin,
       total_limit_time_min: totalLimitTimeMin,
       totalLimitTimeMin: totalLimitTimeMin,
+      total_eco_drive_time_min: totalEcoDriveTimeMin,
+      total_limit_drive_time_min: totalLimitDriveTimeMin,
+      total_eco_charge_time_min: totalEcoChargeTimeMin,
+      total_limit_charge_time_min: totalLimitChargeTimeMin,
+      total_eco_preconditioning_time_min: totalEcoPreconditioningTimeMin,
+      total_limit_preconditioning_time_min: totalLimitPreconditioningTimeMin,
       total_eco_cost_eur: totalEcoCostEur,
       totalEcoCostEur: totalEcoCostEur,
       total_limit_cost_eur: totalLimitCostEur,
@@ -904,13 +1852,44 @@ export async function POST(req: NextRequest) {
       total_trip_savings_vs_limit_eur: totalLimitTripCostWithRechargeEur - totalEcoTripCostWithRechargeEur,
       optimized_stop_count_eco: ecoStops.length,
       optimized_stop_count_limit: limitStops.length,
+      warnings,
+      planning_assumptions: {
+        route_source: routeSource,
+        max_time_penalty_pct: maxTimePenaltyPct,
+        eco_speed_solver: "full_trip_energy_minimization_under_total_time_constraint",
+        eco_speed_constraint_basis: "drive_time_plus_charging_time_plus_preconditioning",
+        eco_speed_candidate_step_kmh: 5,
+        motorway_min_eco_speed_kmh_normal_conditions: 100,
+        reference_total_trip_time_min: limitEval.totalTimeMin,
+        allowed_total_trip_time_min: allowedEcoTotalTimeMin,
+        optimizer_moves_applied: optimizerMoves,
+        optimizer_profile_evaluations: optimizerEvaluations,
+        use_climate: climateEnabled,
+        climate_intensity_pct: climateIntensity,
+        min_arrival_soc_pct: 10,
+        requested_arrival_soc_pct: requestedBatteryEndPct,
+        effective_arrival_soc_pct: batteryEndPct,
+        safety_reserve_kwh: targetArrivalKwh,
+        preconditioning_minutes_per_stop: 20,
+        preconditioning_minutes_per_stop_max: 20,
+        preconditioning_activation_temp_c: 10,
+        charging_soc_soft_cap_pct: 95,
+        weather_sample_count: Number(weather.samples ?? 0),
+      },
+      battery_end_pct_requested: requestedBatteryEndPct,
+      battery_end_pct_effective: batteryEndPct,
       battery_start_pct: batteryStartPct,
       battery_end_pct: batteryEndPct,
       batteryStartPct,
       batteryEndPct,
-      weather_samples: weather.samples,
+      weather_samples: Number(weather.samples ?? 0),
       weather_avg_temp_c: avgTemp,
       weather_avg_rain_mmh: avgRain,
+      weather_avg_wind_kmh: windAvgKmh,
+      weather_avg_headwind_ms: headwindAvgMs,
+      elevation_gain_m: elevationGainM,
+      elevation_loss_m: elevationLossM,
+      max_grade_pct: maxGradePct,
       weather_temperature_min_c: tempMinC,
       weather_temperature_max_c: tempMaxC,
       rain_present: rainPoints.length > 0,
@@ -943,12 +1922,18 @@ export async function POST(req: NextRequest) {
         electrique_eco_110: {
           energie_kwh: totalEcoEnergy,
           temps_min: totalEcoTimeMin,
+          temps_conduite_min: totalEcoDriveTimeMin,
+          temps_recharge_min: totalEcoChargeTimeMin,
+          temps_preconditionnement_min: totalEcoPreconditioningTimeMin,
           cout_total_eur: totalEcoTripCostAllEur,
           stops: ecoStops.length,
         },
         classique_limite_130: {
           energie_kwh: totalLimitEnergy,
           temps_min: totalLimitTimeMin,
+          temps_conduite_min: totalLimitDriveTimeMin,
+          temps_recharge_min: totalLimitChargeTimeMin,
+          temps_preconditionnement_min: totalLimitPreconditioningTimeMin,
           cout_total_eur: totalLimitTripCostAllEur,
           stops: limitStops.length,
         },
@@ -966,6 +1951,9 @@ export async function POST(req: NextRequest) {
         normal_speed_limit_trip: {
           energy_kwh: totalLimitEnergy,
           time_min: totalLimitTimeMin,
+          drive_time_min: totalLimitDriveTimeMin,
+          charge_time_min: totalLimitChargeTimeMin,
+          preconditioning_time_min: totalLimitPreconditioningTimeMin,
           rolling_cost_eur: totalLimitCostEur,
           recharge_cost_eur: rechargeCostLimitEur + preconditioningCostLimitEur,
           total_cost_eur: totalLimitTripCostWithRechargeAndPrecondEur,
@@ -974,6 +1962,9 @@ export async function POST(req: NextRequest) {
         eco_optimized_trip: {
           energy_kwh: totalEcoEnergy,
           time_min: totalEcoTimeMin,
+          drive_time_min: totalEcoDriveTimeMin,
+          charge_time_min: totalEcoChargeTimeMin,
+          preconditioning_time_min: totalEcoPreconditioningTimeMin,
           rolling_cost_eur: totalEcoCostEur,
           recharge_cost_eur: rechargeCostEcoEur + preconditioningCostEcoEur,
           total_cost_eur: totalEcoTripCostWithRechargeAndPrecondEur,
@@ -988,12 +1979,24 @@ export async function POST(req: NextRequest) {
         total_limit_energy: totalLimitEnergy,
         total_eco_time_min: totalEcoTimeMin,
         total_limit_time_min: totalLimitTimeMin,
+        total_eco_drive_time_min: totalEcoDriveTimeMin,
+        total_limit_drive_time_min: totalLimitDriveTimeMin,
+        total_eco_charge_time_min: totalEcoChargeTimeMin,
+        total_limit_charge_time_min: totalLimitChargeTimeMin,
+        total_eco_preconditioning_time_min: totalEcoPreconditioningTimeMin,
+        total_limit_preconditioning_time_min: totalLimitPreconditioningTimeMin,
         total_eco_cost_eur: totalEcoCostEur,
         total_limit_cost_eur: totalLimitCostEur,
         total_eco_trip_cost_with_recharge_eur: totalEcoTripCostWithRechargeEur,
         total_limit_trip_cost_with_recharge_eur: totalLimitTripCostWithRechargeEur,
         weather_avg_temp_c: avgTemp,
         weather_avg_rain_mmh: avgRain,
+        weather_avg_wind_kmh: windAvgKmh,
+        weather_avg_headwind_ms: headwindAvgMs,
+        elevation_gain_m: elevationGainM,
+        elevation_loss_m: elevationLossM,
+        max_grade_pct: maxGradePct,
+        warnings_count: warnings.length,
       },
       vehicle_profile: body.vehicle_profile ?? {},
     });
