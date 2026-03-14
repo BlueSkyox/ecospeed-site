@@ -73,19 +73,53 @@ function interpolateByIndex(valuesBySample: Map<number, number>, length: number)
 }
 
 async function pointWeather(lat: number, lon: number) {
-  const r = await withTimeout(
-    fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain`, {
-      cache: "no-store",
-    }),
-    7000,
-  );
-  if (!r.ok) throw new Error("weather failed");
-  const j = await r.json();
-  const cur = j?.current ?? {};
-  return {
-    tempC: Number(cur.temperature_2m ?? 20),
-    rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
-  };
+  const providers = [
+    async () => {
+      const r = await withTimeout(
+        fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain`, {
+          cache: "no-store",
+        }),
+        7000,
+      );
+      if (!r.ok) throw new Error("weather failed");
+      const j = await r.json();
+      const cur = j?.current ?? {};
+      return {
+        tempC: Number(cur.temperature_2m ?? 20),
+        rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
+      };
+    },
+    async () => {
+      const r = await withTimeout(
+        fetch(`https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${lat}&lon=${lon}`, {
+          cache: "no-store",
+          headers: {
+            "User-Agent": "EcoSpeed/1.0 (resume weather fallback)",
+          },
+        }),
+        7000,
+      );
+      if (!r.ok) throw new Error("weather failed");
+      const j = await r.json();
+      const series = Array.isArray(j?.properties?.timeseries) ? j.properties.timeseries[0] : null;
+      const instant = series?.data?.instant?.details ?? {};
+      const nextHour = series?.data?.next_1_hours?.details ?? {};
+      return {
+        tempC: Number(instant.air_temperature ?? 20),
+        rainMmH: Math.max(0, Number(nextHour.precipitation_amount ?? 0)),
+      };
+    },
+  ];
+
+  let lastError: Error | null = null;
+  for (const provider of providers) {
+    try {
+      return await provider();
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("weather failed");
+    }
+  }
+  throw lastError ?? new Error("weather failed");
 }
 
 async function fetchElevationChunk(coords: [number, number][]) {

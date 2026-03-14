@@ -5,6 +5,7 @@ type WeatherPoint = {
   distance_km: number;
   temp_c: number;
   rain_mmh: number;
+  wind_kmh?: number;
 };
 
 type WeatherTrendChartProps = {
@@ -35,19 +36,22 @@ export default function WeatherTrendChart({ data, locale }: WeatherTrendChartPro
   const points = data.filter((item, index) => index % Math.max(1, Math.ceil(data.length / 18)) === 0 || index === data.length - 1);
   const tempValues = points.map((item) => Number(item.temp_c ?? 0));
   const rainValues = points.map((item) => Number(item.rain_mmh ?? 0));
+  const windValues = points.map((item) => Number(item.wind_kmh ?? 0));
   const tempPath = buildPath(tempValues, 120, 14);
   const rainPath = buildPath(rainValues, 120, 14);
-  const totalDistanceKm = Number(data[data.length - 1]?.distance_km ?? 0);
+  const windPath = buildPath(windValues, 120, 14);
+  const totalDistanceKm = data.reduce((sum, item) => sum + Number(item.distance_km ?? 0), 0);
 
   return (
     <div className="ecospeed-weather-chart">
       <svg
         viewBox="0 0 100 120"
         preserveAspectRatio="none"
-        aria-label={locale === "fr" ? "Evolution de la temperature et de la pluie" : "Temperature and rain trend"}
+        aria-label={locale === "fr" ? "Evolution de la temperature, de la pluie et du vent" : "Temperature, rain and wind trend"}
       >
         <line x1="0" y1="106" x2="100" y2="106" stroke="rgba(23,49,37,0.12)" strokeWidth="0.8" />
         <path d={rainPath} fill="none" stroke="#2d74c4" strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
+        <path d={windPath} fill="none" stroke="#2f8f5b" strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
         <path d={tempPath} fill="none" stroke="#d88b29" strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
       </svg>
       <div className="ecospeed-chart-legend">
@@ -58,6 +62,10 @@ export default function WeatherTrendChart({ data, locale }: WeatherTrendChartPro
         <span>
           <i className="ecospeed-chart-swatch ecospeed-chart-swatch--rain" />
           {locale === "fr" ? "Pluie" : "Rain"}
+        </span>
+        <span>
+          <i className="ecospeed-chart-swatch ecospeed-chart-swatch--wind" />
+          {locale === "fr" ? "Vent" : "Wind"}
         </span>
         <span>{totalDistanceKm.toFixed(0)} km {locale === "fr" ? "traces" : "tracked"}</span>
       </div>

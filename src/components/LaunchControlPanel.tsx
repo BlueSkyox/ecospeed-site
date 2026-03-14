@@ -49,6 +49,8 @@ type WeatherEdge = {
 
 type RouteSegment = {
   idx: number;
+  coord_from_idx?: number;
+  coord_to_idx?: number;
   distance_km: number;
   speed_limit: number;
   eco_speed: number;
@@ -87,6 +89,7 @@ type RouteApiResponse = {
   weather_avg_temp_c: number;
   weather_avg_rain_mmh: number;
   weather_avg_wind_kmh?: number;
+  weather_avg_headwind_ms?: number;
   weather_temperature_min_c?: number;
   weather_temperature_max_c?: number;
   weather_impact_eco_kwh?: number;
@@ -118,10 +121,14 @@ type RecomputedStop = StationStop & {
   unreachableByKwh: number;
   cannotContinueAfterCharge: boolean;
   postChargeShortfallKwh: number;
+  projectedArrivalPctAfterCharge: number;
+  projectedArrivalThresholdPct: number;
+  unsafeSelectedTarget: boolean;
 };
 
 type VehicleProfile = {
   empty_mass: number;
+  extra_load?: number;
   drag_coefficient: number;
   frontal_area: number;
   rolling_resistance: number;
@@ -366,16 +373,19 @@ const panelCopy = {
     batteryEnd: "Batterie arrivee",
     batteryStartHint: "Pourcentage au depart",
     batteryEndHint: "Reserve souhaitee a l arrivee",
-    passengers: "Passagers",
-    weight: "Poids moyen / passager",
+    load: "Charge additionnelle",
+    loadHint: "Passagers + bagages a ajouter a la masse a vide",
     comfort: "Temperature de confort",
-    comfortHint: "Utilisee pour le modele HVAC",
+    comfortHint: "Comparee a la temperature exterieure reelle pour le modele HVAC",
     vehicle: "Profil vehicule",
     custom: "Personnalise",
     mass: "Masse a vide",
+    totalMass: "Masse totale estimee",
     aero: "Coefficient aero",
     area: "Surface frontale",
     battery: "Batterie utile",
+    chargePower: "Puissance de charge max",
+    profileSnapshot: "Repere vehicule",
     calculate: "Calculer le trajet optimise",
     calculating: "Calcul en cours...",
     resetSession: "Reinitialiser la session",
@@ -394,14 +404,18 @@ const panelCopy = {
     summaryTitle: "Ce que l utilisateur doit voir d abord",
     summaryIntro:
       "La vue resume ne garde que les informations decisives: gains, vitesse recommandee, charge suivante et comparaison simple.",
+    summaryPending:
+      "Renseignez un depart, une arrivee et votre vehicule pour afficher ici les gains, la vitesse conseillee et le plan de charge.",
     estimatedSavings: "Economies estimees",
     energySaved: "Energie economisee",
     timeEco: "Temps eco",
     timeLimit: "Temps limite",
     rechargeEco: "Recharge eco",
     averageWind: "Vent moyen",
+    averageHeadwind: "Vent de face moyen",
     rangeRecovered: "Autonomie recuperee",
-    fastChargeEquivalent: "Equivalent charge rapide",
+    fastChargeEquivalent: "Temps de charge equivalent",
+    fastChargeHint: "Temps equivalent sur une borne rapide 50 kW pour recuperer l energie economisee.",
     quickDrive: "Lecture conduite",
     quickDriveTitle: "Le minimum a regarder pendant le trajet",
     targetSpeed: "Vitesse conseillee maintenant",
@@ -429,6 +443,9 @@ const panelCopy = {
     weather: "Meteo & energie",
     weatherTitle: "Lecture rapide des conditions sur le parcours",
     weatherImpact: "impact meteo",
+    weatherSource: "Source meteo",
+    elevationGain: "Denivele +",
+    elevationLoss: "Denivele -",
     co2Equivalent: "Equivalent CO2",
     tripManagement: "Gestion du trajet",
     tripManagementTitle: "Mettre en pause, reprendre et terminer",
@@ -461,6 +478,9 @@ const panelCopy = {
     chargeChosenTime: "Temps pour cette cible",
     chargeChosenEnergy: "Energie pour cette cible",
     chargeTargetHint: "Doit rester au-dessus du minimum calcule",
+    projectedArrival: "Arrivee projetee a l etape suivante",
+    unsafeChargeTarget:
+      "Cette cible est trop basse pour garder une marge de securite realiste a l arrivee. Augmentez la recharge.",
     strategicPause: "Pause proche de la fenetre des 2 h",
     chargingStationSegment: "sur le segment",
     nearbyStations: "Bornes a proximite",
@@ -498,16 +518,19 @@ const panelCopy = {
     batteryEnd: "Arrival battery",
     batteryStartHint: "State of charge at departure",
     batteryEndHint: "Target reserve on arrival",
-    passengers: "Passengers",
-    weight: "Average weight / passenger",
+    load: "Additional load",
+    loadHint: "Passengers + luggage added on top of curb mass",
     comfort: "Comfort temperature",
-    comfortHint: "Used by the HVAC model",
+    comfortHint: "Compared against real outdoor temperature for the HVAC model",
     vehicle: "Vehicle profile",
     custom: "Custom",
     mass: "Curb mass",
+    totalMass: "Estimated total mass",
     aero: "Drag coefficient",
     area: "Frontal area",
     battery: "Battery capacity",
+    chargePower: "Max charging power",
+    profileSnapshot: "Vehicle snapshot",
     calculate: "Calculate optimized trip",
     calculating: "Calculating...",
     resetSession: "Reset session",
@@ -526,14 +549,18 @@ const panelCopy = {
     summaryTitle: "What the user should see first",
     summaryIntro:
       "The summary keeps only the most important information: gains, recommended speed, next charge and a simple comparison.",
+    summaryPending:
+      "Enter a start, a destination and a vehicle to see the savings, recommended speed and charging plan here.",
     estimatedSavings: "Estimated savings",
     energySaved: "Energy saved",
     timeEco: "Eco time",
     timeLimit: "Speed-limit time",
     rechargeEco: "Eco charging",
     averageWind: "Average wind",
+    averageHeadwind: "Average headwind",
     rangeRecovered: "Recovered range",
-    fastChargeEquivalent: "Fast-charge equivalent",
+    fastChargeEquivalent: "Equivalent charging time",
+    fastChargeHint: "Equivalent time on a 50 kW fast charger to recover the saved energy.",
     quickDrive: "Drive view",
     quickDriveTitle: "The minimum you need to see while driving",
     targetSpeed: "Recommended speed now",
@@ -561,6 +588,9 @@ const panelCopy = {
     weather: "Weather & energy",
     weatherTitle: "Quick reading of conditions along the route",
     weatherImpact: "weather impact",
+    weatherSource: "Weather source",
+    elevationGain: "Elevation gain",
+    elevationLoss: "Elevation loss",
     co2Equivalent: "CO2 equivalent",
     tripManagement: "Trip management",
     tripManagementTitle: "Pause, resume and complete the trip",
@@ -593,6 +623,9 @@ const panelCopy = {
     chargeChosenTime: "Time for this target",
     chargeChosenEnergy: "Energy for this target",
     chargeTargetHint: "Must stay above the calculated minimum",
+    projectedArrival: "Projected arrival at next step",
+    unsafeChargeTarget:
+      "This target is too low to keep a realistic safety buffer on arrival. Increase the charging target.",
     strategicPause: "Close to the 2-hour break window",
     chargingStationSegment: "on segment",
     nearbyStations: "Nearby chargers",
@@ -634,6 +667,10 @@ function formatDuration(minutes?: number) {
 
 function formatMoney(value?: number) {
   return `${Number(value ?? 0).toFixed(2)} EUR`;
+}
+
+function formatKwh(value?: number) {
+  return `${Number(value ?? 0).toFixed(1)} kWh`;
 }
 
 function formatDate(iso: string, locale: Locale) {
@@ -857,8 +894,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const [end, setEnd] = useState("Lyon");
   const [batteryStart, setBatteryStart] = useState(80);
   const [batteryEnd, setBatteryEnd] = useState(20);
-  const [numPassengers, setNumPassengers] = useState(1);
-  const [avgWeightKg, setAvgWeightKg] = useState(75);
+  const [extraLoadKg, setExtraLoadKg] = useState(140);
   const [comfortTempC, setComfortTempC] = useState(20);
   const [vehiclePresetId, setVehiclePresetId] = useState("model-y");
   const [customVehicle, setCustomVehicle] = useState<VehicleProfile>(VEHICLE_PRESETS[0].profile);
@@ -889,6 +925,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
       setEnd(storedTrip.end);
       setComfortTempC(storedTrip.comfortTempC);
       setCustomVehicle(storedTrip.vehicleProfile);
+      setExtraLoadKg(Number(storedTrip.vehicleProfile.extra_load ?? 140));
       setVehiclePresetId("custom");
       setStopSegment(storedTrip.segmentIndex);
       setBatteryBefore(storedTrip.batteryPctBefore);
@@ -925,12 +962,13 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   }, [vehiclePresetId]);
 
   useEffect(() => {
-    if (selectedPreset) setCustomVehicle(selectedPreset.profile);
+    if (selectedPreset) setCustomVehicle({ ...selectedPreset.profile });
   }, [selectedPreset]);
 
   const effectiveVehicle = useMemo(() => {
-    return vehiclePresetId === "custom" || !selectedPreset ? customVehicle : selectedPreset.profile;
-  }, [customVehicle, selectedPreset, vehiclePresetId]);
+    const baseVehicle = vehiclePresetId === "custom" || !selectedPreset ? customVehicle : selectedPreset.profile;
+    return { ...baseVehicle, extra_load: extraLoadKg };
+  }, [customVehicle, extraLoadKg, selectedPreset, vehiclePresetId]);
 
   const totalTripCostEco = useMemo(() => {
     if (!route) return 0;
@@ -956,14 +994,22 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
 
   const weatherSamples = route?.weather_profile_edges ?? [];
   const routeStations = route?.nearbyChargingStations ?? [];
+  const selectedVehicleBatteryKwh = Number(effectiveVehicle.battery_kwh);
   const routeBatteryKwh = Number(route?.vehicle_profile?.battery_kwh ?? effectiveVehicle.battery_kwh);
   const routeMaxChargeKw = Number(route?.vehicle_profile?.max_charge_kw ?? effectiveVehicle.max_charge_kw);
+  const totalVehicleMassKg = Number(effectiveVehicle.empty_mass ?? 0) + Math.max(0, Number(extraLoadKg));
+  const batteryStartKwh = selectedVehicleBatteryKwh * (batteryStart / 100);
+  const batteryEndKwh = selectedVehicleBatteryKwh * (batteryEnd / 100);
+  const fastChargeEquivalentMin = energySavedKwh > 0 ? (energySavedKwh / 50) * 60 : 0;
+  const pendingText = locale === "fr" ? "En attente de calcul" : "Waiting for calculation";
+  const signedHeadwindMs = Number(route?.weather_avg_headwind_ms ?? 0);
   const selectedChargingPlan = useMemo<RecomputedStop[]>(() => {
     if (!route) return [];
     const startBatteryPctValue = Number(route.battery_start_pct ?? batteryStart);
     const endBatteryPctValue = Math.max(10, Number(route.battery_end_pct ?? batteryEnd));
     const finalReserveKwh = routeBatteryKwh * (endBatteryPctValue / 100);
-    const arrivalBufferKwh = Math.max(0.8, routeBatteryKwh * 0.01);
+    const intermediateArrivalReservePct = 15;
+    const arrivalBufferKwh = routeBatteryKwh * (intermediateArrivalReservePct / 100);
     const maxChargeKwh = routeBatteryKwh * 0.95;
     const coords = route.route_coordinates ?? [];
     const edgeProfile = route.weather_profile_edges ?? [];
@@ -1021,6 +1067,11 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
       );
       const chosenTargetEnergyKwh = routeBatteryKwh * (chosenTargetPct / 100);
       const chosenEnergyKwh = Math.max(0, chosenTargetEnergyKwh - Math.max(0, arrivalEnergyKwh));
+      const projectedArrivalEnergyKwhAfterCharge = nextSelectedStop
+        ? chosenTargetEnergyKwh - energyAfterStopKwh
+        : chosenTargetEnergyKwh - energyAfterStopKwh;
+      const projectedArrivalThresholdPct = nextSelectedStop ? intermediateArrivalReservePct : endBatteryPctValue;
+      const projectedArrivalPctAfterCharge = clamp((projectedArrivalEnergyKwhAfterCharge / routeBatteryKwh) * 100, -100, 100);
       const minimumChargingTimeMinutes =
         minimumEnergyToChargeKwh > 0
           ? Math.max(
@@ -1071,6 +1122,9 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
         unreachableByKwh: Math.max(0, -arrivalEnergyKwh),
         cannotContinueAfterCharge: requiredTargetEnergyKwh > maxChargeKwh + 1e-6,
         postChargeShortfallKwh: Math.max(0, requiredTargetEnergyKwh - maxChargeKwh),
+        projectedArrivalPctAfterCharge,
+        projectedArrivalThresholdPct,
+        unsafeSelectedTarget: projectedArrivalPctAfterCharge + 1e-6 < projectedArrivalThresholdPct,
       };
     });
   }, [batteryEnd, batteryStart, chargeTargetsByStop, route, routeBatteryKwh, routeMaxChargeKw, selectedStopsByKey]);
@@ -1083,7 +1137,6 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const ecoConsumptionKwhPer100 = route && route.total_distance_km > 0 ? (route.total_eco_energy / route.total_distance_km) * 100 : 0;
   const autonomyRecoveredKm = ecoConsumptionKwhPer100 > 0 ? (energySavedKwh / ecoConsumptionKwhPer100) * 100 : 0;
   const homeChargeHoursSaved = energySavedKwh / 7.4;
-  const chargingSessionsSaved = energySavedKwh / 50;
   const segmentEnergySavedKwh = route?.segments.reduce((sum, segment) => sum + Math.max(0, segment.limit_energy - segment.eco_energy), 0) ?? 0;
   const achievements = useMemo(
     () => buildAchievements(locale, completedTrips, route, energySavedKwh, co2SavedKg),
@@ -1146,12 +1199,15 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
         end,
         battery_start_pct: batteryStart,
         battery_end_pct: batteryEnd,
-        num_passengers: Math.max(0, Number(numPassengers)),
-        avg_weight_kg: Math.max(0, Number(avgWeightKg)),
+        num_passengers: 0,
+        avg_weight_kg: 0,
         use_climate: true,
         climate_intensity: 55,
         comfort_temp_c: comfortTempC,
-        vehicle_profile: effectiveVehicle,
+        vehicle_profile: {
+          ...effectiveVehicle,
+          extra_load: Math.max(0, Number(extraLoadKg)),
+        },
       };
 
       const response = await fetch("/api/route", {
@@ -1204,7 +1260,8 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const pauseTrip = async () => {
     if (!route || !activeTrip) return;
     const segment = clamp(stopSegment, 1, Math.max(1, route.segments.length));
-    const pointIdx = clamp(segment, 0, Math.max(0, route.route_coordinates.length - 1));
+    const segmentStartIdx = Number(route.segments[Math.max(0, segment - 1)]?.coord_from_idx ?? segment - 1);
+    const pointIdx = clamp(segmentStartIdx, 0, Math.max(0, route.route_coordinates.length - 1));
     const remainingCoords = route.route_coordinates.slice(pointIdx).map(([lat, lon]) => [lon, lat] as [number, number]);
     const remainingEcoSpeedsKmh = (route.weather_profile_edges ?? [])
       .slice(pointIdx)
@@ -1356,6 +1413,9 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 onChange={(event) => setBatteryStart(Number(event.target.value))}
               />
               <span>{t.batteryStartHint}</span>
+              <span>
+                {batteryStart}% = {formatKwh(batteryStartKwh)} {locale === "fr" ? `sur ${formatKwh(selectedVehicleBatteryKwh)} utiles` : `of ${formatKwh(selectedVehicleBatteryKwh)} usable`}
+              </span>
             </div>
 
             <div className="ecospeed-field">
@@ -1369,31 +1429,22 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 onChange={(event) => setBatteryEnd(Number(event.target.value))}
               />
               <span>{t.batteryEndHint}</span>
+              <span>
+                {batteryEnd}% = {formatKwh(batteryEndKwh)} {locale === "fr" ? `a conserver sur ${formatKwh(selectedVehicleBatteryKwh)}` : `to keep from ${formatKwh(selectedVehicleBatteryKwh)}`}
+              </span>
             </div>
 
             <div className="ecospeed-field">
-              <label htmlFor="trip-passengers">{t.passengers}</label>
+              <label htmlFor="trip-load">{t.load}</label>
               <input
-                id="trip-passengers"
+                id="trip-load"
                 type="number"
                 min={0}
-                max={7}
-                value={numPassengers}
-                onChange={(event) => setNumPassengers(Number(event.target.value))}
+                max={600}
+                value={extraLoadKg}
+                onChange={(event) => setExtraLoadKg(Number(event.target.value))}
               />
-            </div>
-
-            <div className="ecospeed-field">
-              <label htmlFor="trip-weight">{t.weight}</label>
-              <input
-                id="trip-weight"
-                type="number"
-                min={30}
-                max={150}
-                value={avgWeightKg}
-                onChange={(event) => setAvgWeightKg(Number(event.target.value))}
-              />
-              <span>en kg</span>
+              <span>{t.loadHint}</span>
             </div>
 
             <div className="ecospeed-field">
@@ -1471,11 +1522,31 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                       }
                     />
                   </div>
+                  <div className="ecospeed-inline-field">
+                    <label htmlFor="custom-charge-power">{t.chargePower}</label>
+                    <input
+                      id="custom-charge-power"
+                      type="number"
+                      step="1"
+                      value={customVehicle.max_charge_kw}
+                      onChange={(event) =>
+                        setCustomVehicle((current) => ({ ...current, max_charge_kw: Number(event.target.value) }))
+                      }
+                    />
+                  </div>
                 </div>
               </div>
             ) : (
               <p className="ecospeed-profile-note">{selectedPreset?.blurb[locale]}</p>
             )}
+
+            <div className="ecospeed-profile-facts" aria-label={t.profileSnapshot}>
+              <span>{t.battery}: {formatKwh(effectiveVehicle.battery_kwh)}</span>
+              <span>{t.mass}: {Math.round(effectiveVehicle.empty_mass)} kg</span>
+              <span>{t.load}: {Math.round(extraLoadKg)} kg</span>
+              <span>{t.totalMass}: {Math.round(totalVehicleMassKg)} kg</span>
+              <span>{t.chargePower}: {Math.round(effectiveVehicle.max_charge_kw)} kW</span>
+            </div>
 
             <div className="ecospeed-actions">
               <button type="submit" className="ecospeed-button" disabled={loading}>
@@ -1540,17 +1611,19 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 <p>{route.co2_equivalents?.message || formatCo2(co2SavedKg, locale)}</p>
               </article>
             </div>
-          ) : null}
+          ) : (
+            <div className="ecospeed-empty-state">{t.summaryPending}</div>
+          )}
           <div className="ecospeed-kpi-grid">
             <div className="ecospeed-kpi">
               <span>{t.estimatedSavings}</span>
-              <strong>{formatMoney(savingsEur)}</strong>
-              <span>{savingsPct.toFixed(1)}% {locale === "fr" ? "vs trajet a la limite" : "vs speed-limit trip"}</span>
+              <strong>{route ? formatMoney(savingsEur) : "--"}</strong>
+              <span>{route ? `${savingsPct.toFixed(1)}% ${locale === "fr" ? "vs trajet a la limite" : "vs speed-limit trip"}` : pendingText}</span>
             </div>
             <div className="ecospeed-kpi">
               <span>{t.energySaved}</span>
-              <strong>{energySavedKwh.toFixed(1)} kWh</strong>
-              <span>{route ? formatCo2(Number(route.co2_avoided_kg ?? 0), locale) : locale === "fr" ? "En attente de calcul" : "Waiting for calculation"}</span>
+              <strong>{route ? formatKwh(energySavedKwh) : "--"}</strong>
+              <span>{route ? formatCo2(Number(route.co2_avoided_kg ?? 0), locale) : pendingText}</span>
             </div>
           </div>
 
@@ -1570,14 +1643,17 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
             <div className="ecospeed-stat">
               <span>{t.averageWind}</span>
               <strong>{route ? `${Number(route.weather_avg_wind_kmh ?? 0).toFixed(0)} km/h` : "--"}</strong>
+              <span>{route ? `${t.weatherSource}: Open-Meteo` : pendingText}</span>
             </div>
             <div className="ecospeed-stat">
               <span>{t.rangeRecovered}</span>
               <strong>{route ? `${autonomyRecoveredKm.toFixed(0)} km` : "--"}</strong>
+              <span>{route ? `${formatKwh(energySavedKwh)} ${locale === "fr" ? "economises" : "saved"}` : pendingText}</span>
             </div>
             <div className="ecospeed-stat">
               <span>{t.fastChargeEquivalent}</span>
-              <strong>{route ? `${chargingSessionsSaved.toFixed(2)} ${locale === "fr" ? "session" : "session"}` : "--"}</strong>
+              <strong>{route ? formatDuration(fastChargeEquivalentMin) : "--"}</strong>
+              <span>{route ? t.fastChargeHint : pendingText}</span>
             </div>
           </div>
         </div>
@@ -1840,9 +1916,25 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                       <span>{Number(route.weather_temperature_min_c ?? route.weather_avg_temp_c).toFixed(1)} C min</span>
                       <span>{Number(route.weather_temperature_max_c ?? route.weather_avg_temp_c).toFixed(1)} C max</span>
                       <span>{route.weather_avg_rain_mmh.toFixed(2)} mm/h {locale === "fr" ? "pluie moyenne" : "average rain"}</span>
+                      <span>{Number(route.weather_avg_wind_kmh ?? 0).toFixed(0)} km/h {t.averageWind.toLowerCase()}</span>
+                      <span>
+                        {Math.abs(signedHeadwindMs).toFixed(1)} m/s{" "}
+                        {locale === "fr"
+                          ? signedHeadwindMs >= 0
+                            ? "vent de face moyen"
+                            : "vent favorable moyen"
+                          : signedHeadwindMs >= 0
+                            ? "average headwind"
+                            : "average tailwind"}
+                      </span>
+                      <span>{Math.round(Number(route.elevation_gain_m ?? 0))} m {t.elevationGain.toLowerCase()}</span>
+                      <span>{Math.round(Number(route.elevation_loss_m ?? 0))} m {t.elevationLoss.toLowerCase()}</span>
                       <span>{Number(route.weather_impact_eco_kwh ?? 0).toFixed(2)} kWh {t.weatherImpact}</span>
                     </div>
                     <WeatherTrendChart data={weatherSamples} locale={locale} />
+                    <p className="ecospeed-footnote">
+                      {t.weatherSource}: Open-Meteo. {locale === "fr" ? "Le vent et la temperature sont echantillonnes automatiquement le long du trace." : "Wind and temperature are sampled automatically along the route."}
+                    </p>
                     <div className="ecospeed-weather-overview">
                       <strong>{t.co2Equivalent}</strong>
                       <p className="ecospeed-footnote">
@@ -2053,6 +2145,21 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                             <span>
                               {t.chargeChosenTime}: {formatDuration(chosenMinutes)}
                             </span>
+                            <span>
+                              {t.projectedArrival}:{" "}
+                              {selected && recomputedStop
+                                ? `${recomputedStop.projectedArrivalPctAfterCharge.toFixed(1)}%`
+                                : pendingText}
+                            </span>
+
+                            {selected && recomputedStop?.unsafeSelectedTarget ? (
+                              <div className="ecospeed-feedback ecospeed-feedback--error">
+                                {t.unsafeChargeTarget}{" "}
+                                {locale === "fr"
+                                  ? `Minimum vise: ${recomputedStop.projectedArrivalThresholdPct.toFixed(0)}%.`
+                                  : `Minimum target: ${recomputedStop.projectedArrivalThresholdPct.toFixed(0)}%.`}
+                              </div>
+                            ) : null}
 
                             <small>
                               {estimatedCost > 0 ? `${formatMoney(estimatedCost)} ${t.costEstimated}` : t.costIncluded}

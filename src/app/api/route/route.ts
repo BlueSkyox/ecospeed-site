@@ -49,6 +49,7 @@ const routeGeometryCache = new Map<
     elevations?: number[];
     ascentM?: number;
     descentM?: number;
+    routeSource?: "ors" | "osrm";
     orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
     orsSteps: OrsStep[];
   }>
@@ -58,13 +59,12 @@ const MIN_REALISTIC_CHARGE_STOP_MIN = 8;
 const CO2_FRANCE_KG_PER_KWH = 0.048;
 const PERSISTENT_CACHE_ROOT = path.join(process.cwd(), ".next", "cache", "ecospeed");
 
-function hasUsableOrsRouteGeometry(value: {
+function hasUsableRouteGeometry(value: {
   coordsRaw?: [number, number][];
   ascentM?: number;
   descentM?: number;
 } | null | undefined) {
-  if (!value || !Array.isArray(value.coordsRaw) || value.coordsRaw.length < 2) return false;
-  return Number.isFinite(Number(value.ascentM ?? Number.NaN)) && Number.isFinite(Number(value.descentM ?? Number.NaN));
+  return Boolean(value && Array.isArray(value.coordsRaw) && value.coordsRaw.length >= 2);
 }
 
 function cacheGet<T>(cache: Map<string, TimedCacheEntry<T>>, key: string): T | null {
@@ -113,6 +113,10 @@ function orsKey() {
     throw new Error("Missing OPENROUTESERVICE_API_KEY or ORS_API_KEY");
   }
   return key;
+}
+
+function hasOrsKey() {
+  return Boolean(process.env.OPENROUTESERVICE_API_KEY || process.env.ORS_API_KEY);
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -164,6 +168,32 @@ function interpolateLineCoords(start: [number, number], end: [number, number], s
   return out;
 }
 
+function simplifyRouteCoords(coords: [number, number][], maxPoints = 600) {
+  if (coords.length <= maxPoints) return coords;
+  const cumulativeM = new Array(coords.length).fill(0);
+  for (let i = 1; i < coords.length; i += 1) {
+    cumulativeM[i] = cumulativeM[i - 1] + haversineM(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+  }
+  const totalM = cumulativeM[cumulativeM.length - 1] ?? 0;
+  if (totalM <= 0) return coords.filter((_, index) => index % Math.ceil(coords.length / maxPoints) === 0);
+
+  const simplified: [number, number][] = [];
+  let cursor = 0;
+  for (let i = 0; i < maxPoints; i += 1) {
+    const targetM = (i / (maxPoints - 1)) * totalM;
+    while (cursor < cumulativeM.length - 1 && cumulativeM[cursor] < targetM) cursor += 1;
+    const point = coords[Math.max(0, Math.min(cursor, coords.length - 1))];
+    if (simplified.length === 0 || simplified[simplified.length - 1][0] !== point[0] || simplified[simplified.length - 1][1] !== point[1]) {
+      simplified.push(point);
+    }
+  }
+  const last = coords[coords.length - 1];
+  if (simplified[simplified.length - 1][0] !== last[0] || simplified[simplified.length - 1][1] !== last[1]) {
+    simplified.push(last);
+  }
+  return simplified;
+}
+
 type RouteBody = {
   start: string;
   end: string;
@@ -204,6 +234,8 @@ type OrsStep = {
 type SegmentOut = {
   idx: number;
   index: number;
+  coord_from_idx: number;
+  coord_to_idx: number;
   lat_start: number;
   lon_start: number;
   lat_end: number;
@@ -324,12 +356,16 @@ function mergeSegmentPair(a: SegmentOut, b: SegmentOut): SegmentOut {
 
   return {
     ...a,
+    coord_from_idx: a.coord_from_idx,
+    coord_to_idx: b.coord_to_idx,
     lat_end: b.lat_end,
     lon_end: b.lon_end,
     distance_m: totalDistanceM,
     distance: totalDistanceM,
     distance_km: totalDistanceM / 1000,
     distanceKm: totalDistanceM / 1000,
+    speed_limit: Math.max(a.speed_limit, b.speed_limit),
+    speedLimit: Math.max(a.speed_limit, b.speed_limit),
     eco_speed: Number(mergedEcoSpeed.toFixed(1)),
     ecoSpeed: Number(mergedEcoSpeed.toFixed(1)),
     eco_energy: a.eco_energy + b.eco_energy,
@@ -368,10 +404,12 @@ function normalizeSegments(
     while (i + 1 < segments.length) {
       const nextSeg = segments[i + 1];
       const nextRange = ranges[i + 1];
-      const sameRoadClass = Math.abs(accSeg.speed_limit - nextSeg.speed_limit) <= 10 && accSeg.way_type === nextSeg.way_type;
       const tooSmall = accSeg.distance_km < 0.15 || accSeg.eco_time_min < 0.25;
       const nextTooSmall = nextSeg.distance_km < 0.15 || nextSeg.eco_time_min < 0.25;
-      if (!(sameRoadClass && (tooSmall || nextTooSmall))) break;
+      const mergeableRoadClass =
+        Math.abs(accSeg.speed_limit - nextSeg.speed_limit) <= 40 &&
+        (accSeg.way_type === nextSeg.way_type || tooSmall || nextTooSmall);
+      if (!(mergeableRoadClass && (tooSmall || nextTooSmall))) break;
       accSeg = mergeSegmentPair(accSeg, nextSeg);
       accRange = { from: accRange.from, to: nextRange.to };
       i += 1;
@@ -394,17 +432,60 @@ async function geocode(text: string): Promise<[number, number]> {
   const cacheKey = normalizePlace(text);
   const cached = cacheGet(geocodeCache, cacheKey);
   if (cached) return cached;
-  const url = `https://api.openrouteservice.org/geocode/search?api_key=${encodeURIComponent(
-    orsKey(),
-  )}&text=${encodeURIComponent(text)}&size=1`;
-  const r = await withTimeout(fetch(url, { cache: "no-store" }), 12000);
-  if (!r.ok) throw new Error("Geocode failed");
-  const data = await r.json();
-  const coord = data?.features?.[0]?.geometry?.coordinates;
-  if (!Array.isArray(coord) || coord.length < 2) throw new Error("Address not found");
-  const out: [number, number] = [Number(coord[0]), Number(coord[1])];
-  cacheSet(geocodeCache, cacheKey, out, 30 * 60 * 1000);
-  return out;
+  const providers = [
+    async (): Promise<[number, number]> => {
+      if (!hasOrsKey()) throw new Error("ORS geocode unavailable");
+      const url = `https://api.openrouteservice.org/geocode/search?api_key=${encodeURIComponent(
+        orsKey(),
+      )}&text=${encodeURIComponent(text)}&size=1`;
+      const r = await withTimeout(fetch(url, { cache: "no-store" }), 12000);
+      if (!r.ok) throw new Error("ORS geocode failed");
+      const data = await r.json();
+      const coord = data?.features?.[0]?.geometry?.coordinates;
+      if (!Array.isArray(coord) || coord.length < 2) throw new Error("Address not found");
+      return [Number(coord[0]), Number(coord[1])];
+    },
+    async (): Promise<[number, number]> => {
+      const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&q=${encodeURIComponent(text)}`;
+      const r = await withTimeout(
+        fetch(url, {
+          cache: "no-store",
+          headers: {
+            "User-Agent": "EcoSpeed/1.0 (route validation fallback geocoder)",
+          },
+        }),
+        12000,
+      );
+      if (!r.ok) throw new Error("Nominatim geocode failed");
+      const data = await r.json();
+      const item = Array.isArray(data) ? data[0] : null;
+      const lon = Number(item?.lon ?? Number.NaN);
+      const lat = Number(item?.lat ?? Number.NaN);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat)) throw new Error("Address not found");
+      return [lon, lat];
+    },
+    async (): Promise<[number, number]> => {
+      const url = `https://photon.komoot.io/api/?limit=1&q=${encodeURIComponent(text)}`;
+      const r = await withTimeout(fetch(url, { cache: "no-store" }), 12000);
+      if (!r.ok) throw new Error("Photon geocode failed");
+      const data = await r.json();
+      const coord = data?.features?.[0]?.geometry?.coordinates;
+      if (!Array.isArray(coord) || coord.length < 2) throw new Error("Address not found");
+      return [Number(coord[0]), Number(coord[1])];
+    },
+  ];
+
+  let lastError: Error | null = null;
+  for (const provider of providers) {
+    try {
+      const out = await provider();
+      cacheSet(geocodeCache, cacheKey, out, 30 * 60 * 1000);
+      return out;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Geocode failed");
+    }
+  }
+  throw lastError ?? new Error("Geocode failed");
 }
 
 async function resolvePoint(input: string): Promise<[number, number]> {
@@ -427,7 +508,7 @@ function elevationCoordsKey(coords: [number, number][]) {
 
 function routeGeometryKey(start: [number, number], end: [number, number]) {
   const h = createHash("sha1");
-  h.update(`${start[0].toFixed(5)},${start[1].toFixed(5)}->${end[0].toFixed(5)},${end[1].toFixed(5)}`);
+  h.update(`v2|${start[0].toFixed(5)},${start[1].toFixed(5)}->${end[0].toFixed(5)},${end[1].toFixed(5)}`);
   return h.digest("hex");
 }
 
@@ -557,31 +638,32 @@ async function fetchRouteGeometry(
 ): Promise<{
   coordsRaw: [number, number][];
   elevations: number[];
-  ascentM: number;
-  descentM: number;
+  ascentM?: number;
+  descentM?: number;
   orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
   orsSteps: OrsStep[];
-  routeSource: "ors";
+  routeSource: "ors" | "osrm";
 }> {
   const cacheKey = routeGeometryKey(startCoord, endCoord);
   const cached = cacheGet(routeGeometryCache, cacheKey);
-  if (hasUsableOrsRouteGeometry(cached)) {
+  if (hasUsableRouteGeometry(cached)) {
     const cachedRoute = cached as {
       coordsRaw: [number, number][];
       elevations?: number[];
-      ascentM: number;
-      descentM: number;
+      ascentM?: number;
+      descentM?: number;
+      routeSource?: "ors" | "osrm";
       orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
       orsSteps: OrsStep[];
     };
     return {
       coordsRaw: cachedRoute.coordsRaw,
       elevations: Array.isArray(cachedRoute.elevations) ? cachedRoute.elevations : [],
-      ascentM: Number(cachedRoute.ascentM),
-      descentM: Number(cachedRoute.descentM),
+      ascentM: Number.isFinite(Number(cachedRoute.ascentM)) ? Number(cachedRoute.ascentM) : undefined,
+      descentM: Number.isFinite(Number(cachedRoute.descentM)) ? Number(cachedRoute.descentM) : undefined,
       orsSeg0: cachedRoute.orsSeg0,
       orsSteps: cachedRoute.orsSteps,
-      routeSource: "ors" as const,
+      routeSource: cachedRoute.routeSource ?? "ors",
     };
   }
   if (cached) routeGeometryCache.delete(cacheKey);
@@ -590,15 +672,17 @@ async function fetchRouteGeometry(
     elevations?: number[];
     ascentM?: number;
     descentM?: number;
+    routeSource?: "ors" | "osrm";
     orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
     orsSteps: OrsStep[];
   }>("route-geometry", cacheKey, 30 * 60 * 1000);
-  if (hasUsableOrsRouteGeometry(persisted)) {
+  if (hasUsableRouteGeometry(persisted)) {
     const persistedRoute = persisted as {
       coordsRaw: [number, number][];
       elevations?: number[];
-      ascentM: number;
-      descentM: number;
+      ascentM?: number;
+      descentM?: number;
+      routeSource?: "ors" | "osrm";
       orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] };
       orsSteps: OrsStep[];
     };
@@ -610,40 +694,162 @@ async function fetchRouteGeometry(
       descentM: persistedRoute.descentM,
       orsSeg0: persistedRoute.orsSeg0,
       orsSteps: persistedRoute.orsSteps,
-      routeSource: "ors" as const,
+      routeSource: persistedRoute.routeSource ?? "ors",
     };
   }
 
-  let lastError: Error | null = null;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      const routeResp = await withTimeout(
-        fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
-          method: "POST",
-          headers: { Authorization: orsKey(), "Content-Type": "application/json" },
-          body: JSON.stringify({ coordinates: [startCoord, endCoord], instructions: true, elevation: true }),
-          cache: "no-store",
-        }),
-        15000,
-      );
-      if (!routeResp.ok) throw new Error(`Route failed: ${routeResp.status}`);
-      const data = await routeResp.json();
-      const feat = data?.features?.[0];
-      const maybeCoords = feat?.geometry?.coordinates as [number, number, number?][] | undefined;
-      if (!Array.isArray(maybeCoords) || maybeCoords.length < 2) throw new Error("No route geometry");
-      const coordsRaw = maybeCoords.map((coord) => [Number(coord[0]), Number(coord[1])] as [number, number]);
-      const elevations = maybeCoords.map((coord) => Number(coord[2] ?? 0));
-      const ascentM = Number(feat?.properties?.ascent ?? Number.NaN);
-      const descentM = Number(feat?.properties?.descent ?? Number.NaN);
-      const orsSeg0 = feat?.properties?.segments?.[0] as { distance?: number; duration?: number; steps?: OrsStep[] };
-      const orsSteps = (Array.isArray(orsSeg0?.steps) ? orsSeg0.steps : []) as OrsStep[];
-      const value = { coordsRaw, elevations, ascentM, descentM, orsSeg0, orsSteps };
-      cacheSet(routeGeometryCache, cacheKey, value, 30 * 60 * 1000);
-      await writePersistentJsonCache("route-geometry", cacheKey, value);
-      return { ...value, routeSource: "ors" as const };
-    } catch (error) {
-      lastError = error instanceof Error ? error : new Error("Route failed");
+  const findNearestCoordIndex = (point: [number, number], coords: [number, number][], startIdx = 0) => {
+    let bestIdx = Math.max(0, Math.min(startIdx, coords.length - 1));
+    let bestDist = Number.POSITIVE_INFINITY;
+    for (let idx = bestIdx; idx < coords.length; idx += 1) {
+      const [lon, lat] = coords[idx];
+      const dist = haversineM(lon, lat, point[0], point[1]);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestIdx = idx;
+      }
+      if (bestDist < 15 && idx > startIdx) break;
     }
+    return bestIdx;
+  };
+
+  const mapOsrmStepType = (maneuverType?: string) => {
+    switch (maneuverType) {
+      case "roundabout":
+      case "rotary":
+      case "exit roundabout":
+        return 7;
+      case "turn":
+      case "end of road":
+      case "new name":
+      case "notification":
+        return 1;
+      case "merge":
+      case "fork":
+      case "on ramp":
+      case "off ramp":
+      case "use lane":
+        return 12;
+      case "depart":
+      case "arrive":
+      case "continue":
+      default:
+        return 13;
+    }
+  };
+
+  const buildOsrmSteps = (
+    steps: Array<{
+      distance?: number;
+      duration?: number;
+      name?: string;
+      geometry?: { coordinates?: [number, number][] };
+      maneuver?: { type?: string; modifier?: string; location?: [number, number] };
+    }>,
+    coords: [number, number][],
+  ) => {
+    let cursor = 0;
+    return steps
+      .map((step) => {
+        const geometryCoords = Array.isArray(step.geometry?.coordinates) ? step.geometry.coordinates : [];
+        const startPoint =
+          geometryCoords[0] ??
+          step.maneuver?.location ??
+          coords[Math.max(0, Math.min(cursor, coords.length - 1))];
+        const endPoint = geometryCoords[geometryCoords.length - 1] ?? startPoint;
+        const fromIdx = findNearestCoordIndex(startPoint, coords, cursor);
+        const toIdx = Math.max(fromIdx + 1, findNearestCoordIndex(endPoint, coords, fromIdx));
+        cursor = Math.min(coords.length - 1, toIdx);
+        const maneuverType = step.maneuver?.type;
+        const modifier = step.maneuver?.modifier;
+        return {
+          distance: Number(step.distance ?? 0),
+          duration: Number(step.duration ?? 0),
+          type: mapOsrmStepType(maneuverType),
+          instruction: [maneuverType, modifier, step.name].filter(Boolean).join(" "),
+          name: step.name,
+          way_points: [fromIdx, Math.min(coords.length - 1, toIdx)] as [number, number],
+        };
+      })
+      .filter((step) => (step.way_points?.[1] ?? 0) > (step.way_points?.[0] ?? 0));
+  };
+
+  let lastError: Error | null = null;
+  if (hasOrsKey()) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const routeResp = await withTimeout(
+          fetch("https://api.openrouteservice.org/v2/directions/driving-car/geojson", {
+            method: "POST",
+            headers: { Authorization: orsKey(), "Content-Type": "application/json" },
+            body: JSON.stringify({ coordinates: [startCoord, endCoord], instructions: true, elevation: true }),
+            cache: "no-store",
+          }),
+          15000,
+        );
+        if (!routeResp.ok) throw new Error(`Route failed: ${routeResp.status}`);
+        const data = await routeResp.json();
+        const feat = data?.features?.[0];
+        const maybeCoords = feat?.geometry?.coordinates as [number, number, number?][] | undefined;
+        if (!Array.isArray(maybeCoords) || maybeCoords.length < 2) throw new Error("No route geometry");
+        const coordsRaw = maybeCoords.map((coord) => [Number(coord[0]), Number(coord[1])] as [number, number]);
+        const elevations = maybeCoords.map((coord) => Number(coord[2] ?? 0));
+        const ascentM = Number(feat?.properties?.ascent ?? Number.NaN);
+        const descentM = Number(feat?.properties?.descent ?? Number.NaN);
+        const orsSeg0 = feat?.properties?.segments?.[0] as { distance?: number; duration?: number; steps?: OrsStep[] };
+        const orsSteps = (Array.isArray(orsSeg0?.steps) ? orsSeg0.steps : []) as OrsStep[];
+        const value = { coordsRaw, elevations, ascentM, descentM, orsSeg0, orsSteps, routeSource: "ors" as const };
+        cacheSet(routeGeometryCache, cacheKey, value, 30 * 60 * 1000);
+        await writePersistentJsonCache("route-geometry", cacheKey, value);
+        return value;
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error("Route failed");
+      }
+    }
+  }
+
+  try {
+    const [startLon, startLat] = startCoord;
+    const [endLon, endLat] = endCoord;
+    const url =
+      `https://router.project-osrm.org/route/v1/driving/${startLon},${startLat};${endLon},${endLat}` +
+      "?overview=full&geometries=geojson&steps=true";
+    const routeResp = await withTimeout(fetch(url, { cache: "no-store" }), 15000);
+    if (!routeResp.ok) throw new Error(`OSRM route failed: ${routeResp.status}`);
+    const data = await routeResp.json();
+    const route = data?.routes?.[0];
+    const coordsRawFull = (route?.geometry?.coordinates ?? []).map(
+      (coord: [number, number]) => [Number(coord[0]), Number(coord[1])] as [number, number],
+    );
+    const coordsRaw = simplifyRouteCoords(coordsRawFull, 600);
+    if (!Array.isArray(coordsRaw) || coordsRaw.length < 2) throw new Error("No OSRM route geometry");
+    const rawSteps = (route?.legs?.[0]?.steps ?? []) as Array<{
+      distance?: number;
+      duration?: number;
+      name?: string;
+      geometry?: { coordinates?: [number, number][] };
+      maneuver?: { type?: string; modifier?: string; location?: [number, number] };
+    }>;
+    const orsSteps = buildOsrmSteps(rawSteps, coordsRaw);
+    const orsSeg0 = {
+      distance: Number(route?.distance ?? 0),
+      duration: Number(route?.duration ?? 0),
+      steps: orsSteps,
+    };
+    const value = {
+      coordsRaw,
+      elevations: [] as number[],
+      ascentM: undefined,
+      descentM: undefined,
+      orsSeg0,
+      orsSteps,
+      routeSource: "osrm" as const,
+    };
+    cacheSet(routeGeometryCache, cacheKey, value, 30 * 60 * 1000);
+    await writePersistentJsonCache("route-geometry", cacheKey, value);
+    return value;
+  } catch (error) {
+    lastError = error instanceof Error ? error : new Error("Route failed");
   }
 
   throw lastError ?? new Error("Route failed");
@@ -664,24 +870,60 @@ async function fetchPointWeather(
   const cacheKey = `${lat.toFixed(3)},${lon.toFixed(3)}`;
   const cached = cacheGet(weatherPointCache, cacheKey);
   if (cached) return cached;
-  const r = await withTimeout(
-    fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain,wind_speed_10m,wind_direction_10m`,
-      { cache: "no-store" },
-    ),
-    7000,
-  );
-  if (!r.ok) throw new Error("weather fetch failed");
-  const j = await r.json();
-  const cur = j?.current ?? {};
-  const out = {
-    tempC: Number(cur.temperature_2m ?? 20),
-    rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
-    windKmh: Math.max(0, Number(cur.wind_speed_10m ?? 0)),
-    windDirFromDeg: ((Number(cur.wind_direction_10m ?? 0) % 360) + 360) % 360,
-  };
-  cacheSet(weatherPointCache, cacheKey, out, 10 * 60 * 1000);
-  return out;
+  const providers = [
+    async () => {
+      const r = await withTimeout(
+        fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain,wind_speed_10m,wind_direction_10m`,
+          { cache: "no-store" },
+        ),
+        7000,
+      );
+      if (!r.ok) throw new Error("Open-Meteo weather fetch failed");
+      const j = await r.json();
+      const cur = j?.current ?? {};
+      return {
+        tempC: Number(cur.temperature_2m ?? 20),
+        rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
+        windKmh: Math.max(0, Number(cur.wind_speed_10m ?? 0)),
+        windDirFromDeg: ((Number(cur.wind_direction_10m ?? 0) % 360) + 360) % 360,
+      };
+    },
+    async () => {
+      const r = await withTimeout(
+        fetch(`https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${lat}&lon=${lon}`, {
+          cache: "no-store",
+          headers: {
+            "User-Agent": "EcoSpeed/1.0 (route weather fallback)",
+          },
+        }),
+        7000,
+      );
+      if (!r.ok) throw new Error("MET Norway weather fetch failed");
+      const j = await r.json();
+      const series = Array.isArray(j?.properties?.timeseries) ? j.properties.timeseries[0] : null;
+      const instant = series?.data?.instant?.details ?? {};
+      const nextHour = series?.data?.next_1_hours?.details ?? {};
+      return {
+        tempC: Number(instant.air_temperature ?? 20),
+        rainMmH: Math.max(0, Number(nextHour.precipitation_amount ?? 0)),
+        windKmh: Math.max(0, Number(instant.wind_speed ?? 0) * 3.6),
+        windDirFromDeg: ((Number(instant.wind_from_direction ?? 0) % 360) + 360) % 360,
+      };
+    },
+  ];
+
+  let lastError: Error | null = null;
+  for (const provider of providers) {
+    try {
+      const out = await provider();
+      cacheSet(weatherPointCache, cacheKey, out, 10 * 60 * 1000);
+      return out;
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("weather fetch failed");
+    }
+  }
+  throw lastError ?? new Error("weather fetch failed");
 }
 
 async function getStationsCached(): Promise<ChargingStation[]> {
@@ -1042,11 +1284,12 @@ function planChargingStops(
   maxChargeKw: number,
 ): StopOut[] {
   if (coords.length < 2 || coordEnergyPrefix.length !== coords.length || coordTimePrefix.length !== coords.length) return [];
+  const minIntermediateArrivalSocPct = 15;
   const finalReserve = batteryKwh * (Math.max(10, targetEndPct) / 100);
-  const legReserve = batteryKwh * 0.1;
+  const legReserve = batteryKwh * (minIntermediateArrivalSocPct / 100);
   const maxChargeSoc = 0.95;
   const maxCharge = batteryKwh * maxChargeSoc;
-  const minArrivalBuffer = Math.max(0.8, batteryKwh * 0.01);
+  const minArrivalBuffer = legReserve;
   const departureBuffer = Math.max(2, batteryKwh * 0.06);
   const totalEnergy = coordEnergyPrefix[coordEnergyPrefix.length - 1];
   const targetRestMinutes = 120;
@@ -1131,12 +1374,12 @@ function planChargingStops(
   while (currentCoordIdx < coords.length - 1 && guard < coords.length + 20) {
     guard += 1;
     const needToFinish = totalEnergy - coordEnergyPrefix[currentCoordIdx] + finalReserve;
-    if (energy >= needToFinish - minArrivalBuffer) break;
+    if (energy >= needToFinish) break;
 
     const chosen = pickStrategicCandidate(currentCoordIdx, energy);
     if (!chosen) break;
 
-    energy = Math.max(minArrivalBuffer, energy - chosen.driveE);
+    energy = Math.max(0, energy - chosen.driveE);
     const remainingFromHere = totalEnergy - coordEnergyPrefix[chosen.coordIdx];
     const canFinishFromChosen = maxCharge >= remainingFromHere + finalReserve + minArrivalBuffer;
     let minimumTargetEnergyKwh = canFinishFromChosen
@@ -1206,7 +1449,7 @@ export async function POST(req: NextRequest) {
     let routeDescentM = Number.NaN;
     let orsSeg0: { distance?: number; duration?: number; steps?: OrsStep[] } | undefined;
     let orsSteps: OrsStep[] = [];
-    let routeSource: "ors" | "synthetic" = "ors";
+    let routeSource: "ors" | "osrm" | "synthetic" = "ors";
     try {
       const routeData = await fetchRouteGeometry(startCoord, endCoord);
       coordsRaw = routeData.coordsRaw;
@@ -1233,7 +1476,7 @@ export async function POST(req: NextRequest) {
     }
 
     const elevations =
-      routeSource === "ors"
+      routeSource !== "synthetic"
         ? routeElevations.length === coordsRaw.length
           ? routeElevations
           : await fetchElevations(coordsRaw)
@@ -1243,7 +1486,7 @@ export async function POST(req: NextRequest) {
 
     const userMax = clamp(Number(body.user_max_speed ?? 130), 30, 180);
     const profile = body.vehicle_profile ?? {};
-    const passengers = Math.max(0, Number(body.num_passengers ?? 1));
+    const passengers = Math.max(0, Number(body.num_passengers ?? 0));
     const avgWeight = Math.max(0, Number(body.avg_weight_kg ?? 75));
     const massKg = Math.max(800, Number(profile.empty_mass ?? 1850)) + Math.max(0, Number(profile.extra_load ?? 0)) + passengers * avgWeight;
     const rawDrag = Number(profile.drag_coefficient ?? 0.26);
@@ -1396,6 +1639,8 @@ export async function POST(req: NextRequest) {
     const buildSegmentOut = (base: PlanningSegmentBase, candidate: PlanningSegmentCandidate, index: number): SegmentOut => ({
       idx: index + 1,
       index: index + 1,
+      coord_from_idx: base.from,
+      coord_to_idx: base.to,
       lat_start: base.lat_start,
       lon_start: base.lon_start,
       lat_end: base.lat_end,
@@ -1430,36 +1675,73 @@ export async function POST(req: NextRequest) {
 
     const planningBases: PlanningSegmentBase[] = [];
     const planningRanges: RouteRange[] = [];
+    const splitPlanningRange = (from: number, to: number, maxDistanceM = 32000): Array<{ from: number; to: number }> => {
+      if (to <= from) return [];
+      let totalDistanceM = 0;
+      for (let coordIdx = from + 1; coordIdx <= to; coordIdx += 1) {
+        const [lon1, lat1] = coordsRaw[coordIdx - 1];
+        const [lon2, lat2] = coordsRaw[coordIdx];
+        totalDistanceM += haversineM(lon1, lat1, lon2, lat2);
+      }
+      const parts = Math.max(1, Math.ceil(totalDistanceM / maxDistanceM));
+      if (parts <= 1) return [{ from, to }];
+
+      const targetPartDistanceM = totalDistanceM / parts;
+      const out: Array<{ from: number; to: number }> = [];
+      let sliceStart = from;
+      let accumulatedSinceSplitM = 0;
+
+      for (let coordIdx = from + 1; coordIdx <= to; coordIdx += 1) {
+        const [lon1, lat1] = coordsRaw[coordIdx - 1];
+        const [lon2, lat2] = coordsRaw[coordIdx];
+        accumulatedSinceSplitM += haversineM(lon1, lat1, lon2, lat2);
+        const remainingCoords = to - coordIdx;
+        const remainingParts = parts - out.length - 1;
+        const canSplitHere = coordIdx > sliceStart && remainingCoords >= remainingParts;
+        if (canSplitHere && accumulatedSinceSplitM >= targetPartDistanceM) {
+          out.push({ from: sliceStart, to: coordIdx });
+          sliceStart = coordIdx;
+          accumulatedSinceSplitM = 0;
+        }
+      }
+
+      if (sliceStart < to) out.push({ from: sliceStart, to });
+      return out.length > 0 ? out : [{ from, to }];
+    };
+
     const addSeg = (from: number, to: number, step?: OrsStep) => {
       if (to <= from || from < 0 || to >= coordsRaw.length) return;
-      const probe = evalRange(from, to, 50);
-      if (probe.distM <= 0) return;
-      const legal = legalLimitFromStep(step, userMax, probe.distM);
-      let speedLimit = Math.min(legal, maneuverCap(step?.type, step?.instruction));
-      speedLimit = snapToFrenchLegalLimit(clamp(speedLimit, 20, userMax), userMax);
-      const limitScenario = speedLimit >= 110 ? Math.min(speedLimit, 130) : speedLimit;
-      const candidates = buildEcoSpeedCandidates(limitScenario)
-        .map((speed) => evaluateRangeCandidate(from, to, speed))
-        .filter((candidate): candidate is PlanningSegmentCandidate => candidate !== null);
-      if (candidates.length === 0) return;
-      const limitCandidate = candidates[0];
-      planningBases.push({
-        from,
-        to,
-        lat_start: coordsRaw[from][1],
-        lon_start: coordsRaw[from][0],
-        lat_end: coordsRaw[to][1],
-        lon_end: coordsRaw[to][0],
-        distance_m: probe.distM,
-        way_type: guessWayType(limitScenario),
-        speed_limit: limitScenario,
-        avgTemp: limitCandidate.avgTemp,
-        avgRain: limitCandidate.avgRain,
-        limitEnergyKwh: limitCandidate.energyKwh,
-        limitTimeMin: limitCandidate.timeMin,
-        candidates,
-      });
-      planningRanges.push({ from, to });
+      const rangesToAdd = splitPlanningRange(from, to);
+      for (const range of rangesToAdd) {
+        const probe = evalRange(range.from, range.to, 50);
+        if (probe.distM <= 0) continue;
+        const legal = legalLimitFromStep(step, userMax, probe.distM);
+        let speedLimit = Math.min(legal, maneuverCap(step?.type, step?.instruction));
+        speedLimit = snapToFrenchLegalLimit(clamp(speedLimit, 20, userMax), userMax);
+        const limitScenario = speedLimit >= 110 ? Math.min(speedLimit, 130) : speedLimit;
+        const candidates = buildEcoSpeedCandidates(limitScenario)
+          .map((speed) => evaluateRangeCandidate(range.from, range.to, speed))
+          .filter((candidate): candidate is PlanningSegmentCandidate => candidate !== null);
+        if (candidates.length === 0) continue;
+        const limitCandidate = candidates[0];
+        planningBases.push({
+          from: range.from,
+          to: range.to,
+          lat_start: coordsRaw[range.from][1],
+          lon_start: coordsRaw[range.from][0],
+          lat_end: coordsRaw[range.to][1],
+          lon_end: coordsRaw[range.to][0],
+          distance_m: probe.distM,
+          way_type: guessWayType(limitScenario),
+          speed_limit: limitScenario,
+          avgTemp: limitCandidate.avgTemp,
+          avgRain: limitCandidate.avgRain,
+          limitEnergyKwh: limitCandidate.energyKwh,
+          limitTimeMin: limitCandidate.timeMin,
+          candidates,
+        });
+        planningRanges.push({ from: range.from, to: range.to });
+      }
     };
 
     if (orsSteps.length > 0) {
@@ -1480,7 +1762,7 @@ export async function POST(req: NextRequest) {
     if (requestedBatteryEndPct < 10) {
       warnings.push("La batterie d'arrivee a ete relevee a 10% minimum pour garder une marge de securite realiste.");
     }
-    if (routeSource !== "ors") {
+    if (routeSource === "synthetic") {
       warnings.push("Le calcul d'itineraire detaille n'etait pas disponible. Un trace de secours a ete utilise, avec une precision de recharge plus faible.");
     }
     const startKwh = batteryKwh * (batteryStartPct / 100);
@@ -1628,8 +1910,12 @@ export async function POST(req: NextRequest) {
     }
 
     const segments = ecoEval.segments;
-    const totalDistance = Number(orsSeg0?.distance ?? segments.reduce((sum, segment) => sum + segment.distance_m, 0));
-    const totalDuration = Number(orsSeg0?.duration ?? segments.reduce((sum, segment) => sum + segment.duration, 0));
+    const totalDistance = Number(
+      routeSource === "ors" ? (orsSeg0?.distance ?? segments.reduce((sum, segment) => sum + segment.distance_m, 0)) : segments.reduce((sum, segment) => sum + segment.distance_m, 0),
+    );
+    const totalDuration = Number(
+      routeSource === "ors" ? (orsSeg0?.duration ?? segments.reduce((sum, segment) => sum + segment.duration, 0)) : segments.reduce((sum, segment) => sum + segment.duration, 0),
+    );
     const totalDistanceKm = totalDistance / 1000;
     const totalEcoEnergy = ecoEval.totalEnergyKwh;
     const totalLimitEnergy = limitEval.totalEnergyKwh;
@@ -1869,6 +2155,7 @@ export async function POST(req: NextRequest) {
         min_arrival_soc_pct: 10,
         requested_arrival_soc_pct: requestedBatteryEndPct,
         effective_arrival_soc_pct: batteryEndPct,
+        minimum_intermediate_arrival_soc_pct: 15,
         safety_reserve_kwh: targetArrivalKwh,
         preconditioning_minutes_per_stop: 20,
         preconditioning_minutes_per_stop_max: 20,
