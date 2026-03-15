@@ -3,7 +3,7 @@
 import dynamic from "next/dynamic";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { ChargingStation } from "@/lib/charging-context";
-import { estimateChargingMinutesFromSoc } from "@/lib/ev";
+import { estimateChargingMinutesFromSoc, normalizeHvacMode, type HvacMode } from "@/lib/ev";
 import NearbyStationsPanel from "./NearbyStationsPanel";
 import WeatherTrendChart from "./WeatherTrendChart";
 
@@ -11,6 +11,7 @@ const TripMap = dynamic(() => import("./TripMap"), { ssr: false });
 
 type Locale = "fr" | "en";
 type ResultsTab = "essentials" | "charging" | "analysis" | "trip";
+type StopRole = "mandatory" | "recommended" | "optional";
 
 type StationStop = {
   segmentIndex: number;
@@ -84,6 +85,10 @@ type RouteApiResponse = {
   total_limit_trip_cost_all_in_eur?: number;
   recharge_needed_eco_kwh: number;
   recharge_needed_limit_kwh: number;
+  eco_recharge_plan_covered_kwh?: number;
+  eco_recharge_plan_needed_kwh?: number;
+  eco_recharge_plan_deficit_kwh?: number;
+  eco_recharge_plan_status?: "ok" | "insufficient";
   recharge_cost_eco_eur: number;
   recharge_cost_limit_eur: number;
   weather_avg_temp_c: number;
@@ -108,6 +113,7 @@ type RecomputedStop = StationStop & {
   key: string;
   selected: boolean;
   computedBatteryLevelAtCharge: number;
+  computedBatteryPctAfterCharge: number;
   computedMinimumEnergyToCharge: number;
   computedMinimumTargetBatteryPct: number;
   computedMinimumChargingTimeMinutes: number;
@@ -125,6 +131,41 @@ type RecomputedStop = StationStop & {
   projectedArrivalThresholdPct: number;
   unsafeSelectedTarget: boolean;
 };
+
+type IndexedStop = StationStop & {
+  originalIndex: number;
+  key: string;
+  coordIndex: number;
+  selected: boolean;
+};
+
+type ChargingPlanSelection = {
+  allStops: IndexedStop[];
+  selectedStops: RecomputedStop[];
+  infeasible: boolean;
+  deficitKwh: number;
+};
+
+function buildAssessmentChargeTargets(
+  allStops: IndexedStop[],
+  selectedStopsByKey: Record<string, boolean>,
+  chargeTargetsByStop: Record<string, number>,
+  removedStopKey: string,
+) {
+  const boostedTargets = { ...chargeTargetsByStop };
+  const removedStop = allStops.find((stop) => stop.key === removedStopKey) ?? null;
+  if (!removedStop) return boostedTargets;
+  for (const stop of allStops) {
+    if (stop.key === removedStopKey) continue;
+    if (selectedStopsByKey[stop.key] === false) continue;
+    if (stop.coordIndex >= removedStop.coordIndex) continue;
+    boostedTargets[stop.key] = 95;
+  }
+  return boostedTargets;
+}
+
+const EMPTY_SELECTED_STOPS: RecomputedStop[] = [];
+const EMPTY_INDEXED_STOPS: IndexedStop[] = [];
 
 type VehicleProfile = {
   empty_mass: number;
@@ -160,7 +201,20 @@ type ActiveTripSession = {
   batteryPctAfter: number;
   didRecharge: boolean;
   comfortTempC: number;
+  hvacMode: HvacMode;
   vehicleProfile: VehicleProfile;
+  resumeProjection?: {
+    remainingEnergyKwh: number;
+    remainingTimeMin: number;
+    projectedEndBatteryPct?: number;
+    refreshedWeatherSamples?: number;
+    updatedAtIso: string;
+  } | null;
+};
+
+type StoredActiveTripSession = Omit<ActiveTripSession, "hvacMode"> & {
+  hvacMode?: HvacMode;
+  climateIntensityPct?: number;
 };
 
 type CompletedTrip = {
@@ -186,6 +240,7 @@ type Achievement = {
 const ACTIVE_TRIP_KEY = "ecospeed_active_trip_v2";
 const COMPLETED_TRIPS_KEY = "ecospeed_completed_trips_v2";
 const MIN_REALISTIC_CHARGE_STOP_MIN = 8;
+const HVAC_MODE_ORDER: HvacMode[] = ["eco", "comfort", "intensive", "max"];
 
 const VEHICLE_PRESETS: VehiclePreset[] = [
   {
@@ -377,6 +432,8 @@ const panelCopy = {
     loadHint: "Passagers + bagages a ajouter a la masse a vide",
     comfort: "Temperature de confort",
     comfortHint: "Comparee a la temperature exterieure reelle pour le modele HVAC",
+    climateIntensity: "Mode HVAC",
+    climateIntensityHint: "Choisissez le ressenti cabine souhaite plutot qu un pourcentage abstrait.",
     vehicle: "Profil vehicule",
     custom: "Personnalise",
     mass: "Masse a vide",
@@ -393,6 +450,10 @@ const panelCopy = {
     statePaused: "Session en pause dans ce navigateur.",
     stateProgress: "Trajet relance avec dernier etat connu.",
     stateReady: "Trajet calcule et pret a etre suivi.",
+    resumeProjection: "Projection reprise",
+    remainingEnergy: "Energie restante",
+    remainingTime: "Temps restant",
+    projectedBattery: "Batterie projetee",
     createdOn: "Cree le",
     segment: "Segment",
     resultsMenu: "Navigation",
@@ -409,7 +470,7 @@ const panelCopy = {
     estimatedSavings: "Economies estimees",
     energySaved: "Energie economisee",
     timeEco: "Temps eco",
-    timeLimit: "Temps limite",
+    timeLimit: "Temps a la vitesse limite",
     rechargeEco: "Recharge eco",
     averageWind: "Vent moyen",
     averageHeadwind: "Vent de face moyen",
@@ -443,7 +504,9 @@ const panelCopy = {
     weather: "Meteo & energie",
     weatherTitle: "Lecture rapide des conditions sur le parcours",
     weatherImpact: "impact meteo",
+    averageHvac: "HVAC moyen",
     weatherSource: "Source meteo",
+    publicChargeValue: "de recharge publique",
     elevationGain: "Denivele +",
     elevationLoss: "Denivele -",
     co2Equivalent: "Equivalent CO2",
@@ -465,6 +528,13 @@ const panelCopy = {
     rechargeHere: "Recharger ici",
     chargeSelectionHint: "Choisissez les arrets ou vous voulez vraiment recharger.",
     atLeastOneStop: "Selectionnez au moins un arret de recharge.",
+    planImpossible: "Trajet impossible avec la selection actuelle.",
+    planImpossibleHint:
+      "Il manque de l energie pour rejoindre la suite du trajet avec une marge realiste. Reajoutez un arret obligatoire ou augmentez la cible de recharge.",
+    stopMandatory: "Obligatoire",
+    stopRecommended: "Recommande",
+    stopOptional: "Optionnel",
+    stopMandatoryHint: "Arret obligatoire: le decocher ferait passer la projection sous la marge minimale de securite.",
     recalculatedStop: "Recalcule selon les arrets conserves",
     unreachableStop: "Cet arret n est plus atteignable avec la selection actuelle.",
     noStopNeeded: "Aucun arret n est necessaire pour ce trajet.",
@@ -522,6 +592,8 @@ const panelCopy = {
     loadHint: "Passengers + luggage added on top of curb mass",
     comfort: "Comfort temperature",
     comfortHint: "Compared against real outdoor temperature for the HVAC model",
+    climateIntensity: "HVAC mode",
+    climateIntensityHint: "Choose the cabin comfort feeling directly instead of an abstract percentage.",
     vehicle: "Vehicle profile",
     custom: "Custom",
     mass: "Curb mass",
@@ -538,6 +610,10 @@ const panelCopy = {
     statePaused: "Session paused in this browser.",
     stateProgress: "Trip resumed with the latest known state.",
     stateReady: "Trip calculated and ready to follow.",
+    resumeProjection: "Resume estimate",
+    remainingEnergy: "Remaining energy",
+    remainingTime: "Remaining time",
+    projectedBattery: "Projected battery",
     createdOn: "Created on",
     segment: "Segment",
     resultsMenu: "Navigation",
@@ -554,7 +630,7 @@ const panelCopy = {
     estimatedSavings: "Estimated savings",
     energySaved: "Energy saved",
     timeEco: "Eco time",
-    timeLimit: "Speed-limit time",
+    timeLimit: "Time at speed limit",
     rechargeEco: "Eco charging",
     averageWind: "Average wind",
     averageHeadwind: "Average headwind",
@@ -588,7 +664,9 @@ const panelCopy = {
     weather: "Weather & energy",
     weatherTitle: "Quick reading of conditions along the route",
     weatherImpact: "weather impact",
+    averageHvac: "Average HVAC",
     weatherSource: "Weather source",
+    publicChargeValue: "public charging",
     elevationGain: "Elevation gain",
     elevationLoss: "Elevation loss",
     co2Equivalent: "CO2 equivalent",
@@ -610,6 +688,13 @@ const panelCopy = {
     rechargeHere: "Charge here",
     chargeSelectionHint: "Choose the stops where you actually want to charge.",
     atLeastOneStop: "Select at least one charging stop.",
+    planImpossible: "Trip is not feasible with the current selection.",
+    planImpossibleHint:
+      "There is not enough energy to continue with a realistic reserve. Re-enable a required stop or increase the charging target.",
+    stopMandatory: "Mandatory",
+    stopRecommended: "Recommended",
+    stopOptional: "Optional",
+    stopMandatoryHint: "Mandatory stop: disabling it would push the projection below the minimum safety reserve.",
     recalculatedStop: "Recalculated from the kept stops",
     unreachableStop: "This stop can no longer be reached with the current selection.",
     noStopNeeded: "No stop is required for this trip.",
@@ -696,6 +781,38 @@ function formatPercent(value: number) {
   return `${value.toFixed(1)}%`;
 }
 
+function hvacModeLabel(mode: HvacMode, locale: Locale) {
+  const labels: Record<HvacMode, Record<Locale, string>> = {
+    eco: { fr: "Economique", en: "Eco" },
+    comfort: { fr: "Confort", en: "Comfort" },
+    intensive: { fr: "Intensif", en: "Intensive" },
+    max: { fr: "Maximum", en: "Maximum" },
+  };
+  return labels[mode][locale];
+}
+
+function hvacModeDescription(mode: HvacMode, locale: Locale) {
+  const descriptions: Record<HvacMode, Record<Locale, string>> = {
+    eco: {
+      fr: "Ventilation legere, avec une petite variation de temperature acceptable.",
+      en: "Light ventilation, with a small temperature variation remaining acceptable.",
+    },
+    comfort: {
+      fr: "Usage normal pour garder une temperature de cabine stable.",
+      en: "Normal usage to keep cabin temperature stable.",
+    },
+    intensive: {
+      fr: "Chauffe ou refroidit plus vite pour des passagers plus exigeants.",
+      en: "Heats or cools faster for more demanding passengers.",
+    },
+    max: {
+      fr: "Pour grand froid ou forte canicule, quand le confort prime.",
+      en: "For deep cold or heavy heat when comfort comes first.",
+    },
+  };
+  return descriptions[mode][locale];
+}
+
 function estimateChargingMinutesForTarget(
   currentPct: number,
   targetPct: number,
@@ -748,6 +865,148 @@ function nearestCoordIndexOnPath(point: [number, number], path: Array<[number, n
     }
   }
   return bestIndex;
+}
+
+function computeChargingPlanSelection(
+  route: RouteApiResponse,
+  selectedStopsByKey: Record<string, boolean>,
+  chargeTargetsByStop: Record<string, number>,
+  routeBatteryKwh: number,
+  routeMaxChargeKw: number,
+  batteryStart: number,
+  batteryEnd: number,
+): ChargingPlanSelection {
+  const startBatteryPctValue = Number(route.battery_start_pct ?? batteryStart);
+  const endBatteryPctValue = Math.max(10, Number(route.battery_end_pct ?? batteryEnd));
+  const finalReserveKwh = routeBatteryKwh * (endBatteryPctValue / 100);
+  const intermediateArrivalReservePct = 15;
+  const arrivalBufferKwh = routeBatteryKwh * (intermediateArrivalReservePct / 100);
+  const maxChargeKwh = routeBatteryKwh * 0.95;
+  const coords = route.route_coordinates ?? [];
+  const edgeProfile = route.weather_profile_edges ?? [];
+  const coordEnergyPrefix = new Array(Math.max(1, coords.length)).fill(0);
+  const coordTimePrefix = new Array(Math.max(1, coords.length)).fill(0);
+  const coordDistancePrefix = new Array(Math.max(1, coords.length)).fill(0);
+
+  for (let edgeIndex = 0; edgeIndex < Math.max(0, coords.length - 1); edgeIndex += 1) {
+    const edgeDistanceKm = Number(edgeProfile[edgeIndex]?.distance_km ?? haversineKm(coords[edgeIndex], coords[edgeIndex + 1]));
+    const ecoSpeedKmh = Math.max(20, Number(edgeProfile[edgeIndex]?.eco_speed_kmh ?? 90));
+    coordEnergyPrefix[edgeIndex + 1] = coordEnergyPrefix[edgeIndex] + Number(edgeProfile[edgeIndex]?.eco_energy_kwh ?? 0);
+    coordTimePrefix[edgeIndex + 1] =
+      coordTimePrefix[edgeIndex] + Number(edgeProfile[edgeIndex]?.eco_time_min ?? (edgeDistanceKm / ecoSpeedKmh) * 60);
+    coordDistancePrefix[edgeIndex + 1] = coordDistancePrefix[edgeIndex] + edgeDistanceKm;
+  }
+
+  const allStops: IndexedStop[] = route.routeChargingStations
+    .map((stop, index) => ({
+      ...stop,
+      originalIndex: index,
+      key: buildStopKey(stop, index),
+      coordIndex: coords.length > 0 ? nearestCoordIndexOnPath([stop.station.latitude, stop.station.longitude], coords) : 0,
+      selected: selectedStopsByKey[buildStopKey(stop, index)] !== false,
+    }))
+    .sort((a, b) => a.coordIndex - b.coordIndex || a.originalIndex - b.originalIndex);
+
+  const keptStops = allStops.filter((stop) => stop.selected);
+  let previousCoordIndex = 0;
+  let currentEnergyKwh = routeBatteryKwh * (startBatteryPctValue / 100);
+
+  const selectedStops = keptStops.map((stop, keptIndex) => {
+    const energyToStopKwh = coordEnergyPrefix[stop.coordIndex] - coordEnergyPrefix[previousCoordIndex];
+    const driveTimeMin = coordTimePrefix[stop.coordIndex] - coordTimePrefix[previousCoordIndex];
+    const driveDistanceKm = coordDistancePrefix[stop.coordIndex] - coordDistancePrefix[previousCoordIndex];
+    const arrivalEnergyKwh = currentEnergyKwh - energyToStopKwh;
+    const safeArrivalEnergyKwh = Math.max(0, arrivalEnergyKwh);
+    const nextSelectedStop = keptStops[keptIndex + 1];
+    const energyAfterStopKwh = nextSelectedStop
+      ? coordEnergyPrefix[nextSelectedStop.coordIndex] - coordEnergyPrefix[stop.coordIndex]
+      : Math.max(0, Number(coordEnergyPrefix[coordEnergyPrefix.length - 1] ?? 0) - coordEnergyPrefix[stop.coordIndex]);
+    const requiredTargetEnergyKwh = nextSelectedStop
+      ? Math.max(0, energyAfterStopKwh + arrivalBufferKwh)
+      : Math.max(0, energyAfterStopKwh + finalReserveKwh);
+    const minimumTargetEnergyKwh = Math.min(maxChargeKwh, requiredTargetEnergyKwh);
+    const minimumEnergyToChargeKwh = Math.max(0, minimumTargetEnergyKwh - safeArrivalEnergyKwh);
+    const minimumTargetBatteryPct = clamp((minimumTargetEnergyKwh / routeBatteryKwh) * 100, 0, 95);
+    const chosenTargetPct = clamp(
+      Number(chargeTargetsByStop[stop.key] ?? Math.ceil(minimumTargetBatteryPct)),
+      Math.ceil(minimumTargetBatteryPct),
+      95,
+    );
+    const chosenTargetEnergyKwh = routeBatteryKwh * (chosenTargetPct / 100);
+    const departureEnergyAfterChargeKwh = Math.max(safeArrivalEnergyKwh, chosenTargetEnergyKwh);
+    const chosenEnergyKwh = Math.max(0, departureEnergyAfterChargeKwh - safeArrivalEnergyKwh);
+    const projectedArrivalEnergyKwhAfterCharge = departureEnergyAfterChargeKwh - energyAfterStopKwh;
+    const projectedArrivalThresholdPct = nextSelectedStop ? intermediateArrivalReservePct : endBatteryPctValue;
+    const projectedArrivalPctAfterCharge = clamp((projectedArrivalEnergyKwhAfterCharge / routeBatteryKwh) * 100, -100, 100);
+    const minimumChargingTimeMinutes =
+      minimumEnergyToChargeKwh > 0
+        ? Math.max(
+            MIN_REALISTIC_CHARGE_STOP_MIN,
+            estimateChargingMinutesForTarget(
+              clamp((safeArrivalEnergyKwh / routeBatteryKwh) * 100, 0, 100),
+              minimumTargetBatteryPct,
+              routeBatteryKwh,
+              routeMaxChargeKw,
+              Number(stop.station.powerKw ?? routeMaxChargeKw),
+            ),
+          )
+        : 0;
+    const chosenChargingTimeMinutes =
+      chosenEnergyKwh > 0
+        ? Math.max(
+            MIN_REALISTIC_CHARGE_STOP_MIN,
+            estimateChargingMinutesForTarget(
+              clamp((safeArrivalEnergyKwh / routeBatteryKwh) * 100, 0, 100),
+              chosenTargetPct,
+              routeBatteryKwh,
+              routeMaxChargeKw,
+              Number(stop.station.powerKw ?? routeMaxChargeKw),
+            ),
+          )
+        : 0;
+    const estimatedStationCost = chosenEnergyKwh > 0 ? chosenEnergyKwh * estimateStationPriceEurPerKwh(stop.station) : 0;
+    const maximumDepartureEnergyKwh = Math.max(safeArrivalEnergyKwh, maxChargeKwh);
+
+    currentEnergyKwh = departureEnergyAfterChargeKwh;
+    previousCoordIndex = stop.coordIndex;
+
+    return {
+      ...stop,
+      computedBatteryLevelAtCharge: clamp((arrivalEnergyKwh / routeBatteryKwh) * 100, -100, 100),
+      computedBatteryPctAfterCharge: clamp((departureEnergyAfterChargeKwh / routeBatteryKwh) * 100, 0, 100),
+      computedMinimumEnergyToCharge: minimumEnergyToChargeKwh,
+      computedMinimumTargetBatteryPct: minimumTargetBatteryPct,
+      computedMinimumChargingTimeMinutes: minimumChargingTimeMinutes,
+      computedChosenTargetPct: chosenTargetPct,
+      computedChosenEnergyKwh: chosenEnergyKwh,
+      computedChosenChargingTimeMinutes: chosenChargingTimeMinutes,
+      computedEstimatedChargeCostEur: estimatedStationCost,
+      computedDriveTimeFromPreviousStopMin: driveTimeMin,
+      computedDriveDistanceFromPreviousStopKm: driveDistanceKm,
+      unreachable: arrivalEnergyKwh < 0 || requiredTargetEnergyKwh > maxChargeKwh + 1e-6,
+      unreachableByKwh: Math.max(0, -arrivalEnergyKwh),
+      cannotContinueAfterCharge: requiredTargetEnergyKwh > maxChargeKwh + 1e-6,
+      postChargeShortfallKwh: Math.max(0, requiredTargetEnergyKwh - maximumDepartureEnergyKwh),
+      projectedArrivalPctAfterCharge,
+      projectedArrivalThresholdPct,
+      unsafeSelectedTarget: projectedArrivalPctAfterCharge + 1e-6 < projectedArrivalThresholdPct,
+    } satisfies RecomputedStop;
+  });
+
+  const lastCoordIndex = keptStops.length > 0 ? keptStops[keptStops.length - 1].coordIndex : 0;
+  const remainingToFinishKwh = Math.max(
+    0,
+    Number(coordEnergyPrefix[coordEnergyPrefix.length - 1] ?? 0) - Number(coordEnergyPrefix[lastCoordIndex] ?? 0),
+  );
+  const deficitKwh = Math.max(0, remainingToFinishKwh + finalReserveKwh - currentEnergyKwh);
+  const infeasible = deficitKwh > 0.5 || selectedStops.some((stop) => stop.unreachable || stop.unsafeSelectedTarget);
+
+  return {
+    allStops,
+    selectedStops,
+    infeasible,
+    deficitKwh,
+  };
 }
 
 function buildAchievements(
@@ -896,6 +1155,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const [batteryEnd, setBatteryEnd] = useState(20);
   const [extraLoadKg, setExtraLoadKg] = useState(140);
   const [comfortTempC, setComfortTempC] = useState(20);
+  const [hvacMode, setHvacMode] = useState<HvacMode>("comfort");
   const [vehiclePresetId, setVehiclePresetId] = useState("model-y");
   const [customVehicle, setCustomVehicle] = useState<VehicleProfile>(VEHICLE_PRESETS[0].profile);
   const [loading, setLoading] = useState(false);
@@ -915,22 +1175,29 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const [activeResultsTab, setActiveResultsTab] = useState<ResultsTab>("essentials");
 
   useEffect(() => {
-    const storedTrip = readJson<ActiveTripSession | null>(ACTIVE_TRIP_KEY, null);
+    const storedTrip = readJson<StoredActiveTripSession | null>(ACTIVE_TRIP_KEY, null);
     const storedHistory = readJson<CompletedTrip[]>(COMPLETED_TRIPS_KEY, []);
     setCompletedTrips(storedHistory);
     if (storedTrip) {
-      setActiveTrip(storedTrip);
-      setRoute(storedTrip.route);
-      setStart(storedTrip.start);
-      setEnd(storedTrip.end);
-      setComfortTempC(storedTrip.comfortTempC);
-      setCustomVehicle(storedTrip.vehicleProfile);
-      setExtraLoadKg(Number(storedTrip.vehicleProfile.extra_load ?? 140));
+      const hydratedHvacMode = normalizeHvacMode(storedTrip.hvacMode, storedTrip.climateIntensityPct);
+      const hydratedTrip: ActiveTripSession = {
+        ...storedTrip,
+        hvacMode: hydratedHvacMode,
+        resumeProjection: storedTrip.resumeProjection ?? null,
+      };
+      setActiveTrip(hydratedTrip);
+      setRoute(hydratedTrip.route);
+      setStart(hydratedTrip.start);
+      setEnd(hydratedTrip.end);
+      setComfortTempC(hydratedTrip.comfortTempC);
+      setHvacMode(hydratedTrip.hvacMode);
+      setCustomVehicle(hydratedTrip.vehicleProfile);
+      setExtraLoadKg(Number(hydratedTrip.vehicleProfile.extra_load ?? 140));
       setVehiclePresetId("custom");
-      setStopSegment(storedTrip.segmentIndex);
-      setBatteryBefore(storedTrip.batteryPctBefore);
-      setBatteryAfter(storedTrip.batteryPctAfter);
-      setDidRecharge(storedTrip.didRecharge);
+      setStopSegment(hydratedTrip.segmentIndex);
+      setBatteryBefore(hydratedTrip.batteryPctBefore);
+      setBatteryAfter(hydratedTrip.batteryPctAfter);
+      setDidRecharge(hydratedTrip.didRecharge);
     }
   }, []);
 
@@ -1003,136 +1270,93 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   const fastChargeEquivalentMin = energySavedKwh > 0 ? (energySavedKwh / 50) * 60 : 0;
   const pendingText = locale === "fr" ? "En attente de calcul" : "Waiting for calculation";
   const signedHeadwindMs = Number(route?.weather_avg_headwind_ms ?? 0);
-  const selectedChargingPlan = useMemo<RecomputedStop[]>(() => {
-    if (!route) return [];
-    const startBatteryPctValue = Number(route.battery_start_pct ?? batteryStart);
-    const endBatteryPctValue = Math.max(10, Number(route.battery_end_pct ?? batteryEnd));
-    const finalReserveKwh = routeBatteryKwh * (endBatteryPctValue / 100);
-    const intermediateArrivalReservePct = 15;
-    const arrivalBufferKwh = routeBatteryKwh * (intermediateArrivalReservePct / 100);
-    const maxChargeKwh = routeBatteryKwh * 0.95;
-    const coords = route.route_coordinates ?? [];
-    const edgeProfile = route.weather_profile_edges ?? [];
-    const coordEnergyPrefix = new Array(Math.max(1, coords.length)).fill(0);
-    const coordTimePrefix = new Array(Math.max(1, coords.length)).fill(0);
-    const coordDistancePrefix = new Array(Math.max(1, coords.length)).fill(0);
-    for (let edgeIndex = 0; edgeIndex < Math.max(0, coords.length - 1); edgeIndex += 1) {
-      const edgeDistanceKm = Number(edgeProfile[edgeIndex]?.distance_km ?? haversineKm(coords[edgeIndex], coords[edgeIndex + 1]));
-      const ecoSpeedKmh = Math.max(20, Number(edgeProfile[edgeIndex]?.eco_speed_kmh ?? 90));
-      coordEnergyPrefix[edgeIndex + 1] =
-        coordEnergyPrefix[edgeIndex] + Number(edgeProfile[edgeIndex]?.eco_energy_kwh ?? 0);
-      coordTimePrefix[edgeIndex + 1] =
-        coordTimePrefix[edgeIndex] + Number(edgeProfile[edgeIndex]?.eco_time_min ?? (edgeDistanceKm / ecoSpeedKmh) * 60);
-      coordDistancePrefix[edgeIndex + 1] =
-        coordDistancePrefix[edgeIndex] + edgeDistanceKm;
-    }
-
-    const allStops = route.routeChargingStations.map((stop, index) => ({
-      ...stop,
-      originalIndex: index,
-      key: buildStopKey(stop, index),
-      coordIndex: coords.length > 0 ? nearestCoordIndexOnPath([stop.station.latitude, stop.station.longitude], coords) : 0,
-      selected: selectedStopsByKey[buildStopKey(stop, index)] !== false,
-    })).sort((a, b) => a.coordIndex - b.coordIndex || a.originalIndex - b.originalIndex);
-    const keptStops = allStops.filter((stop) => stop.selected);
-    let previousCoordIndex = 0;
-    let currentEnergyKwh = routeBatteryKwh * (startBatteryPctValue / 100);
-
-    return keptStops.map((stop, keptIndex) => {
-      const energyToStopKwh =
-        coordEnergyPrefix[stop.coordIndex] - coordEnergyPrefix[previousCoordIndex];
-      const driveTimeMin =
-        coordTimePrefix[stop.coordIndex] - coordTimePrefix[previousCoordIndex];
-      const driveDistanceKm =
-        coordDistancePrefix[stop.coordIndex] - coordDistancePrefix[previousCoordIndex];
-      const arrivalEnergyKwh = currentEnergyKwh - energyToStopKwh;
-      const nextSelectedStop = keptStops[keptIndex + 1];
-      const energyAfterStopKwh =
-        nextSelectedStop
-          ? coordEnergyPrefix[nextSelectedStop.coordIndex] - coordEnergyPrefix[stop.coordIndex]
-          : Math.max(0, Number(coordEnergyPrefix[coordEnergyPrefix.length - 1] ?? 0) - coordEnergyPrefix[stop.coordIndex]);
-      const requiredTargetEnergyKwh = nextSelectedStop
-        ? Math.max(0, energyAfterStopKwh + arrivalBufferKwh)
-        : Math.max(0, energyAfterStopKwh + finalReserveKwh);
-      const minimumTargetEnergyKwh = Math.min(
-        maxChargeKwh,
-        requiredTargetEnergyKwh,
-      );
-      const minimumEnergyToChargeKwh = Math.max(0, minimumTargetEnergyKwh - Math.max(0, arrivalEnergyKwh));
-      const minimumTargetBatteryPct = clamp((minimumTargetEnergyKwh / routeBatteryKwh) * 100, 0, 95);
-      const chosenTargetPct = clamp(
-        Number(chargeTargetsByStop[stop.key] ?? Math.ceil(minimumTargetBatteryPct)),
-        Math.ceil(minimumTargetBatteryPct),
-        95,
-      );
-      const chosenTargetEnergyKwh = routeBatteryKwh * (chosenTargetPct / 100);
-      const chosenEnergyKwh = Math.max(0, chosenTargetEnergyKwh - Math.max(0, arrivalEnergyKwh));
-      const projectedArrivalEnergyKwhAfterCharge = nextSelectedStop
-        ? chosenTargetEnergyKwh - energyAfterStopKwh
-        : chosenTargetEnergyKwh - energyAfterStopKwh;
-      const projectedArrivalThresholdPct = nextSelectedStop ? intermediateArrivalReservePct : endBatteryPctValue;
-      const projectedArrivalPctAfterCharge = clamp((projectedArrivalEnergyKwhAfterCharge / routeBatteryKwh) * 100, -100, 100);
-      const minimumChargingTimeMinutes =
-        minimumEnergyToChargeKwh > 0
-          ? Math.max(
-              MIN_REALISTIC_CHARGE_STOP_MIN,
-              estimateChargingMinutesForTarget(
-                clamp((Math.max(0, arrivalEnergyKwh) / routeBatteryKwh) * 100, 0, 100),
-                minimumTargetBatteryPct,
-                routeBatteryKwh,
-                routeMaxChargeKw,
-                Number(stop.station.powerKw ?? routeMaxChargeKw),
-              ),
-            )
-          : 0;
-      const chosenChargingTimeMinutes =
-        chosenEnergyKwh > 0
-          ? Math.max(
-              MIN_REALISTIC_CHARGE_STOP_MIN,
-              estimateChargingMinutesForTarget(
-                clamp((Math.max(0, arrivalEnergyKwh) / routeBatteryKwh) * 100, 0, 100),
-                chosenTargetPct,
-                routeBatteryKwh,
-                routeMaxChargeKw,
-                Number(stop.station.powerKw ?? routeMaxChargeKw),
-              ),
-            )
-          : 0;
-      const estimatedStationCost =
-        chosenEnergyKwh > 0
-          ? chosenEnergyKwh * estimateStationPriceEurPerKwh(stop.station)
-          : 0;
-
-      currentEnergyKwh = Math.max(0, arrivalEnergyKwh) + chosenEnergyKwh;
-      previousCoordIndex = stop.coordIndex;
-
-      return {
-        ...stop,
-        computedBatteryLevelAtCharge: clamp((arrivalEnergyKwh / routeBatteryKwh) * 100, -100, 100),
-        computedMinimumEnergyToCharge: minimumEnergyToChargeKwh,
-        computedMinimumTargetBatteryPct: minimumTargetBatteryPct,
-        computedMinimumChargingTimeMinutes: minimumChargingTimeMinutes,
-        computedChosenTargetPct: chosenTargetPct,
-        computedChosenEnergyKwh: chosenEnergyKwh,
-        computedChosenChargingTimeMinutes: chosenChargingTimeMinutes,
-        computedEstimatedChargeCostEur: estimatedStationCost,
-        computedDriveTimeFromPreviousStopMin: driveTimeMin,
-        computedDriveDistanceFromPreviousStopKm: driveDistanceKm,
-        unreachable: arrivalEnergyKwh < 0 || requiredTargetEnergyKwh > maxChargeKwh + 1e-6,
-        unreachableByKwh: Math.max(0, -arrivalEnergyKwh),
-        cannotContinueAfterCharge: requiredTargetEnergyKwh > maxChargeKwh + 1e-6,
-        postChargeShortfallKwh: Math.max(0, requiredTargetEnergyKwh - maxChargeKwh),
-        projectedArrivalPctAfterCharge,
-        projectedArrivalThresholdPct,
-        unsafeSelectedTarget: projectedArrivalPctAfterCharge + 1e-6 < projectedArrivalThresholdPct,
-      };
-    });
+  const averageHvacKw = weatherSamples.length
+    ? weatherSamples.reduce((sum, sample) => sum + Number(sample.hvac_kw ?? 0), 0) / weatherSamples.length
+    : 0;
+  const representativePublicChargePriceEurPerKwh = useMemo(() => {
+    const stationStops = route?.routeChargingStations ?? [];
+    const prices = stationStops
+      .map((stop) => estimateStationPriceEurPerKwh(stop.station))
+      .filter((price) => Number.isFinite(price) && price > 0);
+    if (prices.length === 0) return 0.43;
+    return prices.reduce((sum, price) => sum + price, 0) / prices.length;
+  }, [route]);
+  const energySavedPublicChargeEur = energySavedKwh * representativePublicChargePriceEurPerKwh;
+  const chargingPlanState = useMemo<ChargingPlanSelection | null>(() => {
+    if (!route) return null;
+    return computeChargingPlanSelection(
+      route,
+      selectedStopsByKey,
+      chargeTargetsByStop,
+      routeBatteryKwh,
+      routeMaxChargeKw,
+      batteryStart,
+      batteryEnd,
+    );
   }, [batteryEnd, batteryStart, chargeTargetsByStop, route, routeBatteryKwh, routeMaxChargeKw, selectedStopsByKey]);
+  const selectedChargingPlan = chargingPlanState?.selectedStops ?? EMPTY_SELECTED_STOPS;
+  const allChargeStops = chargingPlanState?.allStops ?? EMPTY_INDEXED_STOPS;
+  const selectedPlanImpossible = chargingPlanState?.infeasible ?? false;
+  const selectedPlanDeficitKwh = chargingPlanState?.deficitKwh ?? 0;
   const selectedChargingCount = selectedChargingPlan.length;
   const selectedChargingPlanByKey = useMemo(
     () => new Map(selectedChargingPlan.map((stop) => [stop.key, stop])),
     [selectedChargingPlan],
   );
+  const stopAssessmentByKey = useMemo(() => {
+    const assessments = new Map<
+      string,
+      {
+        role: StopRole;
+        mandatory: boolean;
+        deselectionDeficitKwh: number;
+      }
+    >();
+    if (!route) return assessments;
+    for (const stop of allChargeStops) {
+      const recomputedStop = selectedChargingPlanByKey.get(stop.key) ?? null;
+      let mandatory = false;
+      let deselectionDeficitKwh = 0;
+      if (stop.selected) {
+        const nextSelection = { ...selectedStopsByKey, [stop.key]: false };
+        const nextPlan = computeChargingPlanSelection(
+          route,
+          nextSelection,
+          chargeTargetsByStop,
+          routeBatteryKwh,
+          routeMaxChargeKw,
+          batteryStart,
+          batteryEnd,
+        );
+        const boostedTargets = buildAssessmentChargeTargets(allChargeStops, selectedStopsByKey, chargeTargetsByStop, stop.key);
+        const boostedPlan = computeChargingPlanSelection(
+          route,
+          nextSelection,
+          boostedTargets,
+          routeBatteryKwh,
+          routeMaxChargeKw,
+          batteryStart,
+          batteryEnd,
+        );
+        mandatory = nextPlan.infeasible && boostedPlan.infeasible;
+        deselectionDeficitKwh = mandatory ? Math.min(nextPlan.deficitKwh, boostedPlan.deficitKwh) : 0;
+      }
+      const driveTimeMin = Number(recomputedStop?.computedDriveTimeFromPreviousStopMin ?? stop.driveTimeFromPreviousStopMin ?? 0);
+      const role: StopRole = mandatory ? "mandatory" : driveTimeMin >= 100 && driveTimeMin <= 140 ? "recommended" : "optional";
+      assessments.set(stop.key, { role, mandatory, deselectionDeficitKwh });
+    }
+    return assessments;
+  }, [
+    allChargeStops,
+    batteryEnd,
+    batteryStart,
+    chargeTargetsByStop,
+    route,
+    routeBatteryKwh,
+    routeMaxChargeKw,
+    selectedChargingPlanByKey,
+    selectedStopsByKey,
+  ]);
   const co2SavedKg = Math.max(0, Number(route?.co2_avoided_kg ?? 0));
   const ecoConsumptionKwhPer100 = route && route.total_distance_km > 0 ? (route.total_eco_energy / route.total_distance_km) * 100 : 0;
   const autonomyRecoveredKm = ecoConsumptionKwhPer100 > 0 ? (energySavedKwh / ecoConsumptionKwhPer100) * 100 : 0;
@@ -1146,6 +1370,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
     ? route.segments[Math.max(0, Math.min(route.segments.length - 1, stopSegment - 1))]
     : null;
   const nextChargingStop = selectedChargingPlan.find((stop) => stop.segmentIndex >= Math.max(1, stopSegment)) ?? null;
+  const backendPlanImpossible = route?.eco_recharge_plan_status === "insufficient";
   const resultTabs: Array<{ id: ResultsTab; label: string }> = [
     { id: "essentials", label: t.tabEssentials },
     { id: "charging", label: t.tabCharging },
@@ -1168,16 +1393,19 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
   };
 
   const toggleChargingStop = (stopKey: string, checked: boolean) => {
-    setSelectedStopsByKey((current) => {
-      const next = { ...current, [stopKey]: checked };
-      const activeCount = Object.values(next).filter(Boolean).length;
-      if (activeCount === 0) {
-        setChargeSelectionError(t.atLeastOneStop);
-        return current;
-      }
-      setChargeSelectionError("");
-      return next;
-    });
+    const assessment = stopAssessmentByKey.get(stopKey);
+    if (!checked && assessment?.mandatory) {
+      const deficitText =
+        assessment.deselectionDeficitKwh > 0
+          ? locale === "fr"
+            ? ` Deficit estime: ${assessment.deselectionDeficitKwh.toFixed(1)} kWh.`
+            : ` Estimated deficit: ${assessment.deselectionDeficitKwh.toFixed(1)} kWh.`
+          : "";
+      setChargeSelectionError(`${t.stopMandatoryHint}${deficitText}`);
+      return;
+    }
+    setSelectedStopsByKey((current) => ({ ...current, [stopKey]: checked }));
+    setChargeSelectionError("");
   };
 
   const submitRoute = async (event: FormEvent) => {
@@ -1202,7 +1430,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
         num_passengers: 0,
         avg_weight_kg: 0,
         use_climate: true,
-        climate_intensity: 55,
+        hvac_mode: hvacMode,
         comfort_temp_c: comfortTempC,
         vehicle_profile: {
           ...effectiveVehicle,
@@ -1246,7 +1474,9 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
         batteryPctAfter: batteryStart,
         didRecharge: false,
         comfortTempC,
+        hvacMode,
         vehicleProfile: effectiveVehicle,
+        resumeProjection: null,
       };
       persistActiveTrip(nextTrip);
     } catch (err) {
@@ -1278,7 +1508,9 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
       batteryPctAfter: didRecharge ? clamp(batteryAfter, 0, 100) : clamp(batteryBefore, 0, 100),
       didRecharge,
       comfortTempC,
+      hvacMode,
       vehicleProfile: effectiveVehicle,
+      resumeProjection: null,
     };
 
     persistActiveTrip(nextTrip);
@@ -1296,6 +1528,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
           remainingCoords: nextTrip.remainingCoords,
           remainingEcoSpeedsKmh: nextTrip.remainingEcoSpeedsKmh,
           comfortTempC: nextTrip.comfortTempC,
+          hvacMode: nextTrip.hvacMode,
           vehicleProfile: nextTrip.vehicleProfile,
           distanceKm: route.total_distance_km,
         }),
@@ -1334,16 +1567,26 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
 
       if (!response.ok) throw new Error(data.error || (locale === "fr" ? "La reprise a echoue." : "Resume failed."));
 
-      const nextTrip: ActiveTripSession = {
-        ...activeTrip,
-        status: "in_progress",
-      };
-      persistActiveTrip(nextTrip);
-
       const refreshed = Array.isArray(data.weatherRefresh?.samples) ? data.weatherRefresh?.samples.length : 0;
       const remainingEnergy = Number(data.recalculated_remaining_energy_kwh ?? Number.NaN);
       const remainingTime = Number(data.recalculated_remaining_time_min ?? Number.NaN);
       const projectedEndBattery = Number(data.projected_end_battery_pct ?? Number.NaN);
+      const resumeProjection =
+        Number.isFinite(remainingEnergy) && Number.isFinite(remainingTime)
+          ? {
+              remainingEnergyKwh: remainingEnergy,
+              remainingTimeMin: remainingTime,
+              projectedEndBatteryPct: Number.isFinite(projectedEndBattery) ? projectedEndBattery : undefined,
+              refreshedWeatherSamples: refreshed,
+              updatedAtIso: new Date().toISOString(),
+            }
+          : null;
+      const nextTrip: ActiveTripSession = {
+        ...activeTrip,
+        status: "in_progress",
+        resumeProjection,
+      };
+      persistActiveTrip(nextTrip);
 
       if (Number.isFinite(remainingEnergy) && Number.isFinite(remainingTime)) {
         const batteryText = Number.isFinite(projectedEndBattery)
@@ -1458,6 +1701,26 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 onChange={(event) => setComfortTempC(Number(event.target.value))}
               />
               <span>{t.comfortHint}</span>
+            </div>
+
+            <div className="ecospeed-field">
+              <label id="trip-hvac-mode-label">{t.climateIntensity}</label>
+              <div className="ecospeed-choice-grid" role="radiogroup" aria-labelledby="trip-hvac-mode-label">
+                {HVAC_MODE_ORDER.map((mode) => (
+                  <label key={mode} className={`ecospeed-choice-card ${hvacMode === mode ? "is-active" : ""}`}>
+                    <input
+                      type="radio"
+                      name="trip-hvac-mode"
+                      value={mode}
+                      checked={hvacMode === mode}
+                      onChange={() => setHvacMode(mode)}
+                    />
+                    <strong>{hvacModeLabel(mode, locale)}</strong>
+                    <span>{hvacModeDescription(mode, locale)}</span>
+                  </label>
+                ))}
+              </div>
+              <span>{t.climateIntensityHint}</span>
             </div>
 
             <div className="ecospeed-field">
@@ -1585,7 +1848,23 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 <span className="ecospeed-badge">{activeTrip.end}</span>
                 <span className="ecospeed-badge">{t.createdOn} {formatDate(activeTrip.createdAtIso, locale)}</span>
                 <span className="ecospeed-badge">{t.segment} {activeTrip.segmentIndex}</span>
+                <span className="ecospeed-badge">{`${t.climateIntensity} ${hvacModeLabel(activeTrip.hvacMode, locale)}`}</span>
               </div>
+              {activeTrip.resumeProjection ? (
+                <div className="ecospeed-weather-overview" style={{ marginTop: 12 }}>
+                  <strong>{t.resumeProjection}</strong>
+                  <div className="ecospeed-badge-row">
+                    <span className="ecospeed-badge">{`${t.remainingEnergy} ${formatKwh(activeTrip.resumeProjection.remainingEnergyKwh)}`}</span>
+                    <span className="ecospeed-badge">{`${t.remainingTime} ${formatDuration(activeTrip.resumeProjection.remainingTimeMin)}`}</span>
+                    {Number.isFinite(activeTrip.resumeProjection.projectedEndBatteryPct)
+                      ? <span className="ecospeed-badge">{`${t.projectedBattery} ${Number(activeTrip.resumeProjection.projectedEndBatteryPct).toFixed(1)}%`}</span>
+                      : null}
+                    {(activeTrip.resumeProjection.refreshedWeatherSamples ?? 0) > 0
+                      ? <span className="ecospeed-badge">{`${activeTrip.resumeProjection.refreshedWeatherSamples} ${locale === "fr" ? "points meteo" : "weather samples"}`}</span>
+                      : null}
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -1601,8 +1880,8 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 <strong>{energySavedKwh.toFixed(1)} kWh</strong>
                 <p>
                   {locale === "fr"
-                    ? `Cela correspond a environ ${autonomyRecoveredKm.toFixed(0)} km d autonomie recuperes ou ${homeChargeHoursSaved.toFixed(1)} h de recharge a domicile.`
-                    : `That equals about ${autonomyRecoveredKm.toFixed(0)} km of recovered range or ${homeChargeHoursSaved.toFixed(1)} h of home charging.`}
+                    ? `Cela correspond a environ ${autonomyRecoveredKm.toFixed(0)} km d autonomie recuperes, ${homeChargeHoursSaved.toFixed(1)} h de recharge a domicile, soit env. ${formatMoney(energySavedPublicChargeEur)} ${t.publicChargeValue}.`
+                    : `That equals about ${autonomyRecoveredKm.toFixed(0)} km of recovered range, ${homeChargeHoursSaved.toFixed(1)} h of home charging, or about ${formatMoney(energySavedPublicChargeEur)} of ${t.publicChargeValue}.`}
                 </p>
               </article>
               <article className="ecospeed-story-card">
@@ -1930,10 +2209,14 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                       <span>{Math.round(Number(route.elevation_gain_m ?? 0))} m {t.elevationGain.toLowerCase()}</span>
                       <span>{Math.round(Number(route.elevation_loss_m ?? 0))} m {t.elevationLoss.toLowerCase()}</span>
                       <span>{Number(route.weather_impact_eco_kwh ?? 0).toFixed(2)} kWh {t.weatherImpact}</span>
+                      <span>{averageHvacKw.toFixed(1)} kW {t.averageHvac.toLowerCase()}</span>
                     </div>
                     <WeatherTrendChart data={weatherSamples} locale={locale} />
                     <p className="ecospeed-footnote">
-                      {t.weatherSource}: Open-Meteo. {locale === "fr" ? "Le vent et la temperature sont echantillonnes automatiquement le long du trace." : "Wind and temperature are sampled automatically along the route."}
+                      {t.weatherSource}: Open-Meteo.{" "}
+                      {locale === "fr"
+                        ? `Le vent et la temperature sont echantillonnes automatiquement le long du trace. Reglage HVAC: ${hvacModeLabel(hvacMode, locale)}. ${hvacModeDescription(hvacMode, locale)}`
+                        : `Wind and temperature are sampled automatically along the route. HVAC setting: ${hvacModeLabel(hvacMode, locale)}. ${hvacModeDescription(hvacMode, locale)}`}
                     </p>
                     <div className="ecospeed-weather-overview">
                       <strong>{t.co2Equivalent}</strong>
@@ -2030,12 +2313,28 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                 ) : (
                   <>
                     <p className="ecospeed-footnote">{t.chargeSelectionHint}</p>
+                    {backendPlanImpossible ? (
+                      <div className="ecospeed-feedback ecospeed-feedback--error">
+                        {locale === "fr"
+                          ? `${t.planImpossible} ${Number(route.eco_recharge_plan_covered_kwh ?? 0).toFixed(1)} kWh couverts sur ${Number(route.eco_recharge_plan_needed_kwh ?? 0).toFixed(1)} kWh necessaires. Deficit: ${Number(route.eco_recharge_plan_deficit_kwh ?? 0).toFixed(1)} kWh. ${t.planImpossibleHint}`
+                          : `${t.planImpossible} ${Number(route.eco_recharge_plan_covered_kwh ?? 0).toFixed(1)} kWh covered out of ${Number(route.eco_recharge_plan_needed_kwh ?? 0).toFixed(1)} kWh needed. Deficit: ${Number(route.eco_recharge_plan_deficit_kwh ?? 0).toFixed(1)} kWh. ${t.planImpossibleHint}`}
+                      </div>
+                    ) : null}
+                    {selectedPlanImpossible ? (
+                      <div className="ecospeed-feedback ecospeed-feedback--error">
+                        {locale === "fr"
+                          ? `${t.planImpossible} Deficit estime apres vos choix: ${selectedPlanDeficitKwh.toFixed(1)} kWh. ${t.planImpossibleHint}`
+                          : `${t.planImpossible} Estimated deficit after your choices: ${selectedPlanDeficitKwh.toFixed(1)} kWh. ${t.planImpossibleHint}`}
+                      </div>
+                    ) : null}
                     {chargeSelectionError ? <div className="ecospeed-feedback ecospeed-feedback--error">{chargeSelectionError}</div> : null}
                     <div className="ecospeed-stop-list">
-                      {route.routeChargingStations.map((stop, index) => {
-                        const stopKey = buildStopKey(stop, index);
-                        const selected = selectedStopsByKey[stopKey] !== false;
+                      {allChargeStops.map((stop) => {
+                        const index = stop.originalIndex;
+                        const stopKey = stop.key;
+                        const selected = stop.selected;
                         const recomputedStop = selectedChargingPlanByKey.get(stopKey) ?? null;
+                        const stopAssessment = stopAssessmentByKey.get(stopKey);
                         const arrivalPct = selected
                           ? Number(recomputedStop?.computedBatteryLevelAtCharge ?? stop.batteryLevelAtCharge ?? 0)
                           : Number(stop.batteryLevelAtCharge ?? 0);
@@ -2067,6 +2366,13 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                           ? Number(recomputedStop?.computedDriveDistanceFromPreviousStopKm ?? stop.driveDistanceFromPreviousStopKm ?? 0)
                           : Number(stop.driveDistanceFromPreviousStopKm ?? 0);
                         const strategicPause = driveTimeMin >= 100 && driveTimeMin <= 140;
+                        const roleLabel =
+                          stopAssessment?.role === "mandatory"
+                            ? t.stopMandatory
+                            : stopAssessment?.role === "recommended"
+                              ? t.stopRecommended
+                              : t.stopOptional;
+                        const checkboxDisabled = Boolean(selected && stopAssessment?.mandatory);
 
                         return (
                           <article key={stopKey} className={`ecospeed-stop ${selected ? "" : "is-inactive"}`}>
@@ -2076,11 +2382,13 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                                   id={`charge-stop-${index}`}
                                   type="checkbox"
                                   checked={selected}
+                                  disabled={checkboxDisabled}
                                   onChange={(event) => toggleChargingStop(stopKey, event.target.checked)}
                                 />
                                 <span>{t.rechargeHere}</span>
                               </label>
                               <span className="ecospeed-chip">{stop.station.powerKw} kW</span>
+                              <span className="ecospeed-chip">{roleLabel}</span>
                             </div>
 
                             <div className="ecospeed-stop__title">
@@ -2094,6 +2402,7 @@ export default function LaunchControlPanel({ locale }: { locale: Locale }) {
                             </div>
 
                             {selected ? <small>{t.recalculatedStop}</small> : null}
+                            {selected && stopAssessment?.mandatory ? <small>{t.stopMandatoryHint}</small> : null}
                             {selected && recomputedStop?.unreachable ? (
                               <div className="ecospeed-feedback ecospeed-feedback--error">
                                 {recomputedStop.unreachableByKwh > 0

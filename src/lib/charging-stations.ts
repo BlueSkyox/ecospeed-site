@@ -1,25 +1,5 @@
+import snapshotStations from "@/data/charging-stations.snapshot.json";
 import type { ChargingStation } from "@/lib/charging-context";
-
-type OcmPoi = {
-  AddressInfo?: {
-    Title?: string;
-    Latitude?: number;
-    Longitude?: number;
-    AddressLine1?: string;
-    Town?: string;
-    StateOrProvince?: string;
-    Postcode?: string;
-  };
-  OperatorInfo?: {
-    Title?: string;
-  };
-  StatusType?: {
-    IsOperational?: boolean;
-  };
-  Connections?: Array<{
-    PowerKW?: number;
-  }>;
-};
 
 type OverpassElement = {
   lat?: number;
@@ -28,7 +8,174 @@ type OverpassElement = {
   tags?: Record<string, string>;
 };
 
-export function estimatePricePerKwh(powerKw: number) {
+type DataGouvDatasetResource = {
+  title?: string;
+  latest?: string;
+  url?: string;
+};
+
+type DataGouvDatasetResponse = {
+  resources?: DataGouvDatasetResource[];
+};
+
+type CsvRow = Record<string, string>;
+
+type FetchOverpassOptions = {
+  bboxes?: BoundingBox[];
+  focus?: {
+    lat: number;
+    lon: number;
+    radiusKm?: number;
+  };
+};
+
+type IrveResourceUrls = {
+  staticUrl: string;
+  dynamicUrl: string | null;
+};
+
+type DynamicPointState = {
+  operational: boolean;
+  available: boolean;
+  occupied: boolean;
+};
+
+type StationAggregate = {
+  name: string;
+  latitude: number;
+  longitude: number;
+  operator?: string;
+  address?: string;
+  powerKw: number;
+  restricted: boolean;
+  dynamicStates: DynamicPointState[];
+};
+
+export type BoundingBox = [south: number, west: number, north: number, east: number];
+
+const DATA_GOUV_IRVE_DATASET_API_URL =
+  "https://www.data.gouv.fr/api/1/datasets/public-charging-stations-for-electric-cars-from-several-cpos/";
+const DEFAULT_FRANCE_BBOX: BoundingBox = [42.3, -5.4, 51.3, 8.8];
+const DEFAULT_UNKNOWN_POWER_KW = 11;
+const DEFAULT_OVERPASS_LAT_TILE_DEG = 2.2;
+const DEFAULT_OVERPASS_LON_TILE_DEG = 2.6;
+const DATA_GOUV_METADATA_TTL_MS = 30 * 60 * 1000;
+const DATA_GOUV_STATIONS_TTL_MS = 15 * 60 * 1000;
+
+const ESTIMATED_OPERATOR_PRICE_TABLE_EUR_PER_KWH: Array<{ match: string[]; price: number }> = [
+  { match: ["tesla"], price: 0.43 },
+  { match: ["ionity"], price: 0.59 },
+  { match: ["fastned"], price: 0.64 },
+  { match: ["electra"], price: 0.49 },
+  { match: ["totalenergies", "total energies", "total"], price: 0.54 },
+  { match: ["allego"], price: 0.59 },
+  { match: ["izivia"], price: 0.52 },
+  { match: ["freshmile"], price: 0.45 },
+  { match: ["eborn"], price: 0.49 },
+];
+
+let dataGouvResourceCache: { expiresAt: number; value: IrveResourceUrls } | null = null;
+let dataGouvStationsCache: { expiresAt: number; value: ChargingStation[] } | null = null;
+
+function normalizeText(value?: string) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeOperatorKey(operator?: string) {
+  return normalizeText(operator)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function normalizeLooseKey(value?: string) {
+  return normalizeText(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+function clampLatitude(value: number) {
+  return Math.max(-90, Math.min(90, value));
+}
+
+function clampLongitude(value: number) {
+  if (value > 180) return 180;
+  if (value < -180) return -180;
+  return value;
+}
+
+function normalizeBoundingBox(bbox: BoundingBox): BoundingBox {
+  const south = clampLatitude(Math.min(bbox[0], bbox[2]));
+  const north = clampLatitude(Math.max(bbox[0], bbox[2]));
+  const west = clampLongitude(Math.min(bbox[1], bbox[3]));
+  const east = clampLongitude(Math.max(bbox[1], bbox[3]));
+  return [south, west, north, east];
+}
+
+function dedupeBoundingBoxes(boxes: BoundingBox[]) {
+  const out = new Map<string, BoundingBox>();
+  for (const box of boxes) {
+    const normalized = normalizeBoundingBox(box);
+    const key = normalized.map((value) => value.toFixed(4)).join("|");
+    if (!out.has(key)) out.set(key, normalized);
+  }
+  return [...out.values()];
+}
+
+function tileBoundingBox(
+  bbox: BoundingBox,
+  maxLatSpanDeg = DEFAULT_OVERPASS_LAT_TILE_DEG,
+  maxLonSpanDeg = DEFAULT_OVERPASS_LON_TILE_DEG,
+) {
+  const [south, west, north, east] = normalizeBoundingBox(bbox);
+  const boxes: BoundingBox[] = [];
+  for (let lat = south; lat < north; lat += maxLatSpanDeg) {
+    for (let lon = west; lon < east; lon += maxLonSpanDeg) {
+      boxes.push([
+        lat,
+        lon,
+        Math.min(north, lat + maxLatSpanDeg),
+        Math.min(east, lon + maxLonSpanDeg),
+      ]);
+    }
+  }
+  return dedupeBoundingBoxes(boxes);
+}
+
+export function buildPointBoundingBox(lat: number, lon: number, radiusKm = 30): BoundingBox {
+  const safeRadiusKm = Math.max(5, Math.min(150, radiusKm));
+  const latDelta = safeRadiusKm / 111;
+  const cosLat = Math.max(0.2, Math.cos((lat * Math.PI) / 180));
+  const lonDelta = safeRadiusKm / (111 * cosLat);
+  return normalizeBoundingBox([lat - latDelta, lon - lonDelta, lat + latDelta, lon + lonDelta]);
+}
+
+export function buildRouteBoundingBoxes(coords: [number, number][], paddingKm = 25) {
+  if (coords.length === 0) return tileBoundingBox(DEFAULT_FRANCE_BBOX);
+  let minLat = Number.POSITIVE_INFINITY;
+  let maxLat = Number.NEGATIVE_INFINITY;
+  let minLon = Number.POSITIVE_INFINITY;
+  let maxLon = Number.NEGATIVE_INFINITY;
+  for (const [lon, lat] of coords) {
+    minLat = Math.min(minLat, lat);
+    maxLat = Math.max(maxLat, lat);
+    minLon = Math.min(minLon, lon);
+    maxLon = Math.max(maxLon, lon);
+  }
+  const centerLat = (minLat + maxLat) / 2;
+  const latPadding = Math.max(0.18, paddingKm / 111);
+  const lonPadding = Math.max(0.18, paddingKm / (111 * Math.max(0.2, Math.cos((centerLat * Math.PI) / 180))));
+  return tileBoundingBox([minLat - latPadding, minLon - lonPadding, maxLat + latPadding, maxLon + lonPadding]);
+}
+
+export function estimatePricePerKwh(powerKw: number, operator?: string) {
+  const normalizedOperator = normalizeOperatorKey(operator);
+  if (normalizedOperator) {
+    for (const entry of ESTIMATED_OPERATOR_PRICE_TABLE_EUR_PER_KWH) {
+      if (entry.match.some((token) => normalizedOperator.includes(token))) return entry.price;
+    }
+  }
   if (powerKw >= 300) return 0.69;
   if (powerKw >= 200) return 0.62;
   if (powerKw >= 150) return 0.56;
@@ -37,114 +184,96 @@ export function estimatePricePerKwh(powerKw: number) {
   return 0.35;
 }
 
-function formatPrice(powerKw: number) {
-  return `${estimatePricePerKwh(powerKw).toFixed(2)} EUR/kWh`;
+function formatPrice(powerKw: number, operator?: string) {
+  return `${estimatePricePerKwh(powerKw, operator).toFixed(2)} EUR/kWh`;
 }
 
-const CORE_STATIONS: ChargingStation[] = [
-  { name: "Ionity Paris Sud", latitude: 48.604, longitude: 2.436, powerKw: 350, status: "Dispo", operator: "Ionity", address: "A6, Essonne", price: formatPrice(350) },
-  { name: "Tesla Supercharger Paris La Defense", latitude: 48.8925, longitude: 2.2383, powerKw: 250, status: "Dispo", operator: "Tesla", address: "La Defense, Paris", price: formatPrice(250) },
-  { name: "TotalEnergies Champs Elysees", latitude: 48.8698, longitude: 2.3081, powerKw: 175, status: "Dispo", operator: "TotalEnergies", address: "Champs Elysees, Paris", price: formatPrice(175) },
-  { name: "Electra Paris Opera", latitude: 48.8706, longitude: 2.3317, powerKw: 150, status: "Dispo", operator: "Electra", address: "Opera, Paris", price: formatPrice(150) },
-  { name: "Fastned Orly", latitude: 48.728, longitude: 2.379, powerKw: 300, status: "Dispo", operator: "Fastned", address: "Orly", price: formatPrice(300) },
-  { name: "Ionity Lyon Est", latitude: 45.734, longitude: 4.95, powerKw: 350, status: "Dispo", operator: "Ionity", address: "A43, Lyon Est", price: formatPrice(350) },
-  { name: "Ionity Marseille Nord", latitude: 43.349, longitude: 5.361, powerKw: 350, status: "Dispo", operator: "Ionity", address: "Marseille Nord", price: formatPrice(350) },
-  { name: "Fastned Bordeaux", latitude: 44.84, longitude: -0.58, powerKw: 300, status: "Dispo", operator: "Fastned", address: "Bordeaux", price: formatPrice(300) },
-  { name: "Ionity Toulouse", latitude: 43.604, longitude: 1.444, powerKw: 350, status: "Dispo", operator: "Ionity", address: "Toulouse", price: formatPrice(350) },
-  { name: "Ionity Lille", latitude: 50.631, longitude: 3.06, powerKw: 350, status: "Dispo", operator: "Ionity", address: "Lille", price: formatPrice(350) },
-];
+export const FALLBACK_STATIONS: ChargingStation[] = (snapshotStations as ChargingStation[]).map((station) => ({
+  ...station,
+  price: formatPrice(Number(station.powerKw ?? DEFAULT_UNKNOWN_POWER_KW), station.operator),
+}));
 
-function buildExtendedFallback() {
-  const out: ChargingStation[] = [];
-  const deltas = [
-    [0, 0],
-    [0.07, 0.03],
-    [-0.05, 0.04],
-    [0.04, -0.06],
-  ];
-  for (const base of CORE_STATIONS) {
-    for (let i = 0; i < deltas.length; i += 1) {
-      const [dLat, dLon] = deltas[i];
-      const power = Math.max(120, base.powerKw - i * 30);
-      out.push({
-        name: `${base.name} ${i + 1}`,
-        latitude: Number((base.latitude + dLat).toFixed(6)),
-        longitude: Number((base.longitude + dLon).toFixed(6)),
-        powerKw: power,
-        status: "Dispo",
-        operator: base.operator ?? "Operator",
-        address: `${base.address ?? base.name} - zone ${i + 1}`,
-        price: formatPrice(power),
-      });
+function parseCsvLine(line: string) {
+  const out: string[] = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const char = line[i];
+    if (char === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i += 1;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
     }
+    if (char === "," && !inQuotes) {
+      out.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
   }
-  return out;
+  out.push(current);
+  return out.map((value) => value.trim());
 }
 
-export const FALLBACK_STATIONS: ChargingStation[] = buildExtendedFallback();
+function parseCsv(text: string): CsvRow[] {
+  const lines = text
+    .replace(/^\uFEFF/, "")
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0);
+  if (lines.length === 0) return [];
+  const headers = parseCsvLine(lines[0]).map((header) => normalizeText(header));
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    const row: CsvRow = {};
+    for (let index = 0; index < headers.length; index += 1) {
+      row[headers[index]] = values[index] ?? "";
+    }
+    return row;
+  });
+}
 
-function mapOcmToStation(poi: OcmPoi) {
-  const lat = Number(poi.AddressInfo?.Latitude);
-  const lon = Number(poi.AddressInfo?.Longitude);
+function parseNumber(rawValue?: string) {
+  const normalized = String(rawValue ?? "").replace(",", ".").trim();
+  if (!normalized) return Number.NaN;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function parseCoordonneesXY(rawValue?: string) {
+  const normalized = normalizeText(rawValue);
+  const match = normalized.match(/\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/);
+  if (!match) return null;
+  const lon = Number(match[1]);
+  const lat = Number(match[2]);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  const name = (poi.AddressInfo?.Title ?? "Charging Station").trim();
-  const maxPower = Math.max(
-    22,
-    ...(poi.Connections ?? []).map((connection) => Number(connection.PowerKW ?? 0)).filter((value) => Number.isFinite(value)),
-  );
-  const operator = (poi.OperatorInfo?.Title ?? "").trim();
-  const address = [
-    poi.AddressInfo?.AddressLine1,
-    poi.AddressInfo?.Town,
-    poi.AddressInfo?.StateOrProvince,
-    poi.AddressInfo?.Postcode,
-  ]
-    .filter(Boolean)
-    .join(", ");
-
-  return {
-    name,
-    latitude: lat,
-    longitude: lon,
-    powerKw: Math.round(maxPower),
-    status: poi.StatusType?.IsOperational === false ? "Indispo" : "Dispo",
-    operator: operator || undefined,
-    address: address || undefined,
-    price: formatPrice(Math.round(maxPower)),
-  } as ChargingStation;
+  return { latitude: lat, longitude: lon };
 }
 
-function parseOverpassPower(rawValue?: string) {
-  if (!rawValue) return 50;
-  const normalized = rawValue.toLowerCase().replace(",", ".");
-  const match = normalized.match(/(\d+(?:\.\d+)?)/);
-  if (!match) return 50;
-  const value = Number(match[1]);
-  if (!Number.isFinite(value)) return 50;
-  return normalized.includes("mw") ? value * 1000 : value;
+function parseDynamicPointState(row: CsvRow): DynamicPointState {
+  const etat = normalizeLooseKey(row.etat_pdc);
+  const occupation = normalizeLooseKey(row.occupation_pdc);
+  const operational = etat.includes("en_service") || etat.includes("service");
+  const available = occupation.includes("libre") || occupation.includes("disponible");
+  const occupied = occupation.includes("occupe") || occupation.includes("occupied");
+  return { operational, available, occupied };
 }
 
-function mapOverpassToStation(element: OverpassElement) {
-  const lat = Number(element.lat ?? element.center?.lat ?? Number.NaN);
-  const lon = Number(element.lon ?? element.center?.lon ?? Number.NaN);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  const tags = element.tags ?? {};
-  const name = tags.name || tags.operator || "Charging Station";
-  const powerKw = Math.max(22, parseOverpassPower(tags.maxpower));
-  const operator = tags.operator || undefined;
-  const address = [tags["addr:housenumber"], tags["addr:street"], tags["addr:city"]].filter(Boolean).join(" ");
-  const status = tags.access === "private" ? "Restreint" : "Dispo";
+function isRestrictedAccess(rawValue?: string) {
+  const normalized = normalizeLooseKey(rawValue);
+  return normalized.includes("reserve") || normalized.includes("prive") || normalized.includes("personnel");
+}
 
-  return {
-    name,
-    latitude: lat,
-    longitude: lon,
-    powerKw: Math.round(powerKw),
-    status,
-    operator,
-    address: address || undefined,
-    price: formatPrice(Math.round(powerKw)),
-  } as ChargingStation;
+function resolveStationStatus(restricted: boolean, dynamicStates: DynamicPointState[]) {
+  if (restricted) return "Restreint";
+  if (dynamicStates.some((state) => state.operational && state.available)) return "Dispo";
+  if (dynamicStates.some((state) => state.operational && state.occupied)) return "Occupe";
+  if (dynamicStates.some((state) => state.operational)) return "Dispo";
+  if (dynamicStates.length > 0) return "Indispo";
+  return "Dispo";
 }
 
 function dedupeStations(stations: ChargingStation[]) {
@@ -156,25 +285,182 @@ function dedupeStations(stations: ChargingStation[]) {
   return [...out.values()];
 }
 
-export async function fetchOpenChargeMapStations(): Promise<ChargingStation[]> {
-  const url =
-    "https://api.openchargemap.io/v3/poi/?output=json&countrycode=FR&maxresults=1200&compact=true&verbose=false";
-  const response = await fetch(url, { cache: "no-store" });
-  if (!response.ok) throw new Error("OpenChargeMap unavailable");
-  const raw = (await response.json()) as OcmPoi[];
-  return dedupeStations(raw.map(mapOcmToStation).filter((station): station is ChargingStation => Boolean(station)));
+function findResourceUrl(resources: DataGouvDatasetResource[], title: string) {
+  const match = resources.find((resource) => normalizeLooseKey(resource.title) === title);
+  return match?.latest || match?.url || null;
 }
 
-export async function fetchOverpassStations(): Promise<ChargingStation[]> {
-  const query = `
+async function fetchLatestIrveResourceUrls(): Promise<IrveResourceUrls> {
+  const now = Date.now();
+  if (dataGouvResourceCache && dataGouvResourceCache.expiresAt > now) return dataGouvResourceCache.value;
+  const response = await fetch(DATA_GOUV_IRVE_DATASET_API_URL, { cache: "no-store" });
+  if (!response.ok) throw new Error("data.gouv.fr dataset unavailable");
+  const dataset = (await response.json()) as DataGouvDatasetResponse;
+  const resources = Array.isArray(dataset.resources) ? dataset.resources : [];
+  const staticUrl = findResourceUrl(resources, "irve-statique.csv");
+  if (!staticUrl) throw new Error("IRVE static resource unavailable");
+  const dynamicUrl = findResourceUrl(resources, "irve-dynamique.csv");
+  const out = { staticUrl, dynamicUrl };
+  dataGouvResourceCache = { expiresAt: now + DATA_GOUV_METADATA_TTL_MS, value: out };
+  return out;
+}
+
+async function fetchCsvRows(url: string) {
+  const response = await fetch(url, {
+    cache: "no-store",
+    headers: {
+      Accept: "text/csv",
+    },
+  });
+  if (!response.ok) throw new Error(`CSV unavailable: ${response.status}`);
+  return parseCsv(await response.text());
+}
+
+function mapFrenchGovernmentStations(staticRows: CsvRow[], dynamicRows: CsvRow[]) {
+  const dynamicByPdc = new Map<string, DynamicPointState>();
+  for (const row of dynamicRows) {
+    const pointId = normalizeText(row.id_pdc_itinerance);
+    if (!pointId) continue;
+    dynamicByPdc.set(pointId, parseDynamicPointState(row));
+  }
+
+  const grouped = new Map<string, StationAggregate>();
+
+  for (const row of staticRows) {
+    const coords = parseCoordonneesXY(row.coordonneesXY);
+    if (!coords) continue;
+    const name = normalizeText(row.nom_station || row.nom_enseigne || row.nom_operateur || "Charging Station");
+    const operator = normalizeText(row.nom_operateur || row.nom_enseigne || row.nom_amenageur);
+    const address = normalizeText(row.adresse_station);
+    const powerKw = parseNumber(row.puissance_nominale);
+    const stationId = normalizeText(row.id_station_itinerance || row.id_station_local || name);
+    const key = `${stationId}|${coords.latitude.toFixed(5)}|${coords.longitude.toFixed(5)}`;
+    const aggregate = grouped.get(key) ?? {
+      name,
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+      operator: operator || undefined,
+      address: address || undefined,
+      powerKw: DEFAULT_UNKNOWN_POWER_KW,
+      restricted: false,
+      dynamicStates: [],
+    };
+
+    if (Number.isFinite(powerKw) && powerKw > 0) {
+      aggregate.powerKw = Math.max(aggregate.powerKw, powerKw);
+    }
+    if (!aggregate.operator && operator) aggregate.operator = operator;
+    if (!aggregate.address && address) aggregate.address = address;
+    aggregate.restricted ||= isRestrictedAccess(row.condition_acces);
+
+    const pointId = normalizeText(row.id_pdc_itinerance);
+    const dynamicState = pointId ? dynamicByPdc.get(pointId) : null;
+    if (dynamicState) aggregate.dynamicStates.push(dynamicState);
+
+    grouped.set(key, aggregate);
+  }
+
+  return dedupeStations(
+    [...grouped.values()].map((station) => {
+      const roundedPower = Math.max(1, Math.round(station.powerKw || DEFAULT_UNKNOWN_POWER_KW));
+      const status = resolveStationStatus(station.restricted, station.dynamicStates);
+      return {
+        name: station.name,
+        latitude: station.latitude,
+        longitude: station.longitude,
+        powerKw: roundedPower,
+        status,
+        operator: station.operator,
+        address: station.address,
+        price: formatPrice(roundedPower, station.operator),
+      } as ChargingStation;
+    }),
+  );
+}
+
+export async function fetchFrenchGovernmentStations(): Promise<ChargingStation[]> {
+  const now = Date.now();
+  if (dataGouvStationsCache && dataGouvStationsCache.expiresAt > now && dataGouvStationsCache.value.length > 0) {
+    return dataGouvStationsCache.value;
+  }
+
+  const resources = await fetchLatestIrveResourceUrls();
+  const [staticRows, dynamicRows] = await Promise.all([
+    fetchCsvRows(resources.staticUrl),
+    resources.dynamicUrl
+      ? fetchCsvRows(resources.dynamicUrl).catch(() => [] as CsvRow[])
+      : Promise.resolve([] as CsvRow[]),
+  ]);
+  const stations = mapFrenchGovernmentStations(staticRows, dynamicRows);
+  if (stations.length === 0) throw new Error("IRVE dataset empty");
+  dataGouvStationsCache = { expiresAt: now + DATA_GOUV_STATIONS_TTL_MS, value: stations };
+  return stations;
+}
+
+function parseOverpassPower(rawValue?: string) {
+  if (!rawValue) return DEFAULT_UNKNOWN_POWER_KW;
+  const normalized = rawValue.toLowerCase().replace(",", ".");
+  const match = normalized.match(/(\d+(?:\.\d+)?)/);
+  if (!match) return DEFAULT_UNKNOWN_POWER_KW;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return DEFAULT_UNKNOWN_POWER_KW;
+  const powerKw = normalized.includes("mw") ? value * 1000 : value;
+  return Math.max(1, powerKw);
+}
+
+function mapOverpassToStation(element: OverpassElement) {
+  const lat = Number(element.lat ?? element.center?.lat ?? Number.NaN);
+  const lon = Number(element.lon ?? element.center?.lon ?? Number.NaN);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  const tags = element.tags ?? {};
+  const operator = normalizeText(tags.operator);
+  const name = normalizeText(tags.name || tags.operator || "Charging Station");
+  const powerKw = parseOverpassPower(tags.maxpower);
+  const address = [tags["addr:housenumber"], tags["addr:street"], tags["addr:city"]]
+    .map((value) => normalizeText(value))
+    .filter(Boolean)
+    .join(" ");
+  const status = tags.access === "private" ? "Restreint" : "Dispo";
+
+  return {
+    name,
+    latitude: lat,
+    longitude: lon,
+    powerKw: Math.round(powerKw),
+    status,
+    operator: operator || undefined,
+    address: address || undefined,
+    price: formatPrice(Math.round(powerKw), operator),
+  } as ChargingStation;
+}
+
+function buildOverpassQuery(bboxes: BoundingBox[]) {
+  const tiledBoxes = bboxes.length > 0 ? dedupeBoundingBoxes(bboxes) : tileBoundingBox(DEFAULT_FRANCE_BBOX);
+  const body = tiledBoxes
+    .map(
+      ([south, west, north, east]) => `
+      node["amenity"="charging_station"](${south}, ${west}, ${north}, ${east});
+      way["amenity"="charging_station"](${south}, ${west}, ${north}, ${east});
+      relation["amenity"="charging_station"](${south}, ${west}, ${north}, ${east});`,
+    )
+    .join("\n");
+  return `
     [out:json][timeout:20];
     (
-      node["amenity"="charging_station"](46.2, -5.4, 51.3, 8.8);
-      way["amenity"="charging_station"](46.2, -5.4, 51.3, 8.8);
-      relation["amenity"="charging_station"](46.2, -5.4, 51.3, 8.8);
+      ${body}
     );
     out center tags;
   `;
+}
+
+export async function fetchOverpassStations(options: FetchOverpassOptions = {}): Promise<ChargingStation[]> {
+  const bboxes =
+    options.bboxes && options.bboxes.length > 0
+      ? options.bboxes
+      : options.focus && Number.isFinite(options.focus.lat) && Number.isFinite(options.focus.lon)
+        ? [buildPointBoundingBox(options.focus.lat, options.focus.lon, options.focus.radiusKm ?? 30)]
+        : tileBoundingBox(DEFAULT_FRANCE_BBOX);
+  const query = buildOverpassQuery(bboxes);
   const response = await fetch("https://overpass-api.de/api/interpreter", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },

@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getRouteChargingContext, type ChargingStation } from "@/lib/charging-context";
-import { FALLBACK_STATIONS, fetchOpenChargeMapStations, fetchOverpassStations } from "@/lib/charging-stations";
+import { FALLBACK_STATIONS, fetchFrenchGovernmentStations, fetchOverpassStations } from "@/lib/charging-stations";
 
 let cache: { ts: number; data: ChargingStation[] } | null = null;
 const STATIONS_CACHE_TTL_MS = 2 * 60_000;
@@ -45,10 +45,7 @@ async function loadStations(forceRefresh = false) {
   }
 
   let out: ChargingStation[] = cache?.data?.length ? cache.data : FALLBACK_STATIONS;
-  const liveSources = await Promise.allSettled([
-    withTimeout(fetchOpenChargeMapStations(), 8000),
-    withTimeout(fetchOverpassStations(), 9000),
-  ]);
+  const liveSources = await Promise.allSettled([withTimeout(fetchFrenchGovernmentStations(), 12000)]);
   const merged = liveSources
     .filter((result): result is PromiseFulfilledResult<ChargingStation[]> => result.status === "fulfilled")
     .flatMap((result) => result.value);
@@ -72,7 +69,28 @@ export async function GET(req: NextRequest) {
   const forceRefresh = req.nextUrl.searchParams.get("refresh") === "1";
 
   try {
-    const stations = await loadStations(forceRefresh);
+    let stations = await loadStations(forceRefresh);
+    if (Number.isFinite(latParam) && Number.isFinite(lonParam)) {
+      try {
+        const localLive = await withTimeout(
+          fetchOverpassStations({
+            focus: {
+              lat: latParam,
+              lon: lonParam,
+              radiusKm,
+            },
+          }),
+          9000,
+        );
+        if (localLive.length > 0) {
+          const dedup = new Map<string, ChargingStation>();
+          for (const station of [...stations, ...localLive]) {
+            dedup.set(`${station.name}|${station.latitude.toFixed(4)}|${station.longitude.toFixed(4)}`, station);
+          }
+          stations = [...dedup.values()];
+        }
+      } catch {}
+    }
 
     const routeScoped = getRouteChargingContext();
     if (routeScoped && routeScoped.length > 0) {
@@ -90,6 +108,23 @@ export async function GET(req: NextRequest) {
 
     return NextResponse.json(filterAround(stations, latParam, lonParam, radiusKm));
   } catch {
+    if (Number.isFinite(latParam) && Number.isFinite(lonParam)) {
+      try {
+        const localLive = await withTimeout(
+          fetchOverpassStations({
+            focus: {
+              lat: latParam,
+              lon: lonParam,
+              radiusKm,
+            },
+          }),
+          9000,
+        );
+        if (localLive.length > 0) {
+          return NextResponse.json(filterAround(localLive, latParam, lonParam, radiusKm));
+        }
+      } catch {}
+    }
     return NextResponse.json(filterAround(FALLBACK_STATIONS, latParam, lonParam, radiusKm));
   }
 }

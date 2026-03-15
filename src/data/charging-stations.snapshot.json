@@ -1,0 +1,92 @@
+[
+  {
+    "name": "Ionity Paris Sud",
+    "latitude": 48.604,
+    "longitude": 2.436,
+    "powerKw": 350,
+    "status": "Dispo",
+    "operator": "Ionity",
+    "address": "A6, Essonne"
+  },
+  {
+    "name": "Tesla Supercharger Paris La Defense",
+    "latitude": 48.8925,
+    "longitude": 2.2383,
+    "powerKw": 250,
+    "status": "Dispo",
+    "operator": "Tesla",
+    "address": "La Defense, Paris"
+  },
+  {
+    "name": "TotalEnergies Champs Elysees",
+    "latitude": 48.8698,
+    "longitude": 2.3081,
+    "powerKw": 175,
+    "status": "Dispo",
+    "operator": "TotalEnergies",
+    "address": "Champs Elysees, Paris"
+  },
+  {
+    "name": "Electra Paris Opera",
+    "latitude": 48.8706,
+    "longitude": 2.3317,
+    "powerKw": 150,
+    "status": "Dispo",
+    "operator": "Electra",
+    "address": "Opera, Paris"
+  },
+  {
+    "name": "Fastned Orly",
+    "latitude": 48.728,
+    "longitude": 2.379,
+    "powerKw": 300,
+    "status": "Dispo",
+    "operator": "Fastned",
+    "address": "Orly"
+  },
+  {
+    "name": "Ionity Lyon Est",
+    "latitude": 45.734,
+    "longitude": 4.95,
+    "powerKw": 350,
+    "status": "Dispo",
+    "operator": "Ionity",
+    "address": "A43, Lyon Est"
+  },
+  {
+    "name": "Ionity Marseille Nord",
+    "latitude": 43.349,
+    "longitude": 5.361,
+    "powerKw": 350,
+    "status": "Dispo",
+    "operator": "Ionity",
+    "address": "Marseille Nord"
+  },
+  {
+    "name": "Fastned Bordeaux",
+    "latitude": 44.84,
+    "longitude": -0.58,
+    "powerKw": 300,
+    "status": "Dispo",
+    "operator": "Fastned",
+    "address": "Bordeaux"
+  },
+  {
+    "name": "Ionity Toulouse",
+    "latitude": 43.604,
+    "longitude": 1.444,
+    "powerKw": 350,
+    "status": "Dispo",
+    "operator": "Ionity",
+    "address": "Toulouse"
+  },
+  {
+    "name": "Ionity Lille",
+    "latitude": 50.631,
+    "longitude": 3.06,
+    "powerKw": 350,
+    "status": "Dispo",
+    "operator": "Ionity",
+    "address": "Lille"
+  }
+]

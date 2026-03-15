@@ -14,6 +14,8 @@ export type WayTypeRange = {
   wayType: number;
 };
 
+export type HvacMode = "eco" | "comfort" | "intensive" | "max";
+
 export type VehicleParams = {
   massKg: number;
   cda: number;
@@ -25,6 +27,7 @@ export type VehicleParams = {
   batteryKwh: number;
   windHeadMs?: number;
   regenMaxKw?: number;
+  currentSocPct?: number;
 };
 
 export type TripResult = {
@@ -40,7 +43,37 @@ export type TripResult = {
 };
 
 export const CHARGING_STOP_DURATION_MIN = 20;
+export const HVAC_PRESETS: Record<HvacMode, number> = {
+  eco: 0,
+  comfort: 1.1,
+  intensive: 2.5,
+  max: 4.5,
+};
 const G = 9.81;
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+export function normalizeHvacMode(hvacMode?: string | null, legacyClimateIntensityPct?: number | null): HvacMode {
+  if (hvacMode === "eco" || hvacMode === "comfort" || hvacMode === "intensive" || hvacMode === "max") {
+    return hvacMode;
+  }
+
+  if (!Number.isFinite(legacyClimateIntensityPct)) return "comfort";
+
+  const legacyBoostKw = (clamp(Number(legacyClimateIntensityPct), 0, 100) / 100) * 2;
+  let bestMode: HvacMode = "comfort";
+  let bestDiff = Number.POSITIVE_INFINITY;
+  for (const [mode, boostKw] of Object.entries(HVAC_PRESETS) as Array<[HvacMode, number]>) {
+    const diff = Math.abs(boostKw - legacyBoostKw);
+    if (diff < bestDiff) {
+      bestMode = mode;
+      bestDiff = diff;
+    }
+  }
+  return bestMode;
+}
 
 export function haversineM(lon1: number, lat1: number, lon2: number, lat2: number): number {
   const R = 6371000;
@@ -153,12 +186,18 @@ export function segEnergyAndTime(
   const regenMaxKw = Math.max(20, Number(v.regenMaxKw ?? 70));
   const regenCapWh = regenMaxKw * 1000 * timeH;
   const regenSpeedFactor = Math.max(0, Math.min(1, (speedKmh - 10) / 25));
+  const regenSocFactor = Number.isFinite(v.currentSocPct)
+    ? clamp((95 - Number(v.currentSocPct)) / 15, 0, 1)
+    : 1;
 
   let elecWh = 0;
   if (mechWh >= 0) {
     elecWh = mechWh / Math.max(v.etaDrive, 1e-3) + auxWh;
   } else {
-    const recoveredWh = Math.min(Math.abs(mechWh) * Math.max(v.regenEff, 0), regenCapWh * regenSpeedFactor);
+    const recoveredWh = Math.min(
+      Math.abs(mechWh) * Math.max(v.regenEff, 0),
+      regenCapWh * regenSpeedFactor * regenSocFactor,
+    );
     elecWh = auxWh - recoveredWh;
   }
   return { energyWh: elecWh, timeH };
@@ -174,6 +213,7 @@ export function routeEnergyTime(
   let totalH = 0;
   let totalM = 0;
   let speedWeighted = 0;
+  let rollingSocPct = Number.isFinite(vehicle.currentSocPct) ? clamp(Number(vehicle.currentSocPct), 0, 100) : Number.NaN;
   for (let i = 1; i < coords.length; i += 1) {
     const [lon1, lat1] = coords[i - 1];
     const [lon2, lat2] = coords[i];
@@ -185,11 +225,17 @@ export function routeEnergyTime(
     const s = Array.isArray(speedKmhOrPerSeg)
       ? Math.max(speedKmhOrPerSeg[Math.min(i - 1, speedKmhOrPerSeg.length - 1)] ?? 30, 1)
       : speedKmhOrPerSeg;
-    const seg = segEnergyAndTime(d, slope, s, vehicle);
+    const seg = segEnergyAndTime(d, slope, s, {
+      ...vehicle,
+      currentSocPct: Number.isFinite(rollingSocPct) ? rollingSocPct : vehicle.currentSocPct,
+    });
     totalWh += seg.energyWh;
     totalH += seg.timeH;
     totalM += d;
     speedWeighted += s * d;
+    if (Number.isFinite(rollingSocPct) && vehicle.batteryKwh > 0) {
+      rollingSocPct = clamp(rollingSocPct - (seg.energyWh / 1000 / vehicle.batteryKwh) * 100, 0, 100);
+    }
   }
   return {
     energyWh: totalWh,
@@ -209,10 +255,11 @@ export function hvacPowerFromTemp(tempC: number, comfortC = 20): number {
   return baseVentilationKw + Math.min(3, 0.1 * delta);
 }
 
-export function airDensityFromTempC(tempC: number, baseRho = 1.225, baseTempC = 15): number {
+export function airDensityFromTempC(tempC: number, baseRho = 1.225, baseTempC = 15, altitudeM = 0): number {
   const tBase = Math.max(180, baseTempC + 273.15);
   const tNow = Math.max(180, tempC + 273.15);
-  return Math.max(0.9, Math.min(1.4, baseRho * (tBase / tNow)));
+  const altitudeFactor = Math.exp(-Math.max(0, altitudeM) / 8500);
+  return Math.max(0.75, Math.min(1.4, baseRho * (tBase / tNow) * altitudeFactor));
 }
 
 export function batteryPreconditioningKw(tempC: number): number {
@@ -228,8 +275,26 @@ export function routeEnergyTimeSegmentWeather(
   vehicleBase: VehicleParams,
   segmentTempsC: number[],
   segmentRainMmH: number[],
-  comfortC = 20,
+  comfortOrOptions:
+    | number
+    | {
+        comfortC?: number;
+        climateEnabled?: boolean;
+        climateBoostKw?: number;
+        segmentHeadwindMs?: number[];
+        startBatteryPct?: number;
+      } = 20,
 ): { energyWh: number; timeH: number; distKm: number; avgSpeed: number } {
+  const options = typeof comfortOrOptions === "number" ? { comfortC: comfortOrOptions } : comfortOrOptions;
+  const comfortC = Number(options.comfortC ?? 20);
+  const climateEnabled = options.climateEnabled ?? true;
+  const climateBoostKw = Math.max(0, Number(options.climateBoostKw ?? 0));
+  const segmentHeadwindMs = options.segmentHeadwindMs ?? [];
+  let rollingSocPct = Number.isFinite(options.startBatteryPct)
+    ? clamp(Number(options.startBatteryPct), 0, 100)
+    : Number.isFinite(vehicleBase.currentSocPct)
+      ? clamp(Number(vehicleBase.currentSocPct), 0, 100)
+      : Number.NaN;
   let totalWh = 0;
   let totalH = 0;
   let totalM = 0;
@@ -250,10 +315,19 @@ export function routeEnergyTimeSegmentWeather(
 
     const temp = segmentTempsC[Math.min(segIdx, segmentTempsC.length - 1)] ?? comfortC;
     const rain = segmentRainMmH[Math.min(segIdx, segmentRainMmH.length - 1)] ?? 0;
+    const headwindMs = segmentHeadwindMs[Math.min(segIdx, segmentHeadwindMs.length - 1)] ?? 0;
+    const avgAltitudeM = (e1 + e2) / 2;
     const segVehicle: VehicleParams = {
       ...vehicleBase,
-      crr: vehicleBase.crr * rainDensityToCrrMultiplier(rain),
-      auxPowerKw: vehicleBase.auxPowerKw + hvacPowerFromTemp(temp, comfortC),
+      crr: vehicleBase.crr * rainDensityToCrrMultiplier(rain) * rollingResistanceTempMultiplier(temp),
+      rhoAir: airDensityFromTempC(temp, vehicleBase.rhoAir, 15, avgAltitudeM),
+      auxPowerKw:
+        vehicleBase.auxPowerKw +
+        climateBoostKw +
+        (climateEnabled ? hvacPowerFromTemp(temp, comfortC) : hvacPowerFromTemp(comfortC, comfortC)) +
+        batteryPreconditioningKw(temp),
+      windHeadMs: headwindMs,
+      currentSocPct: Number.isFinite(rollingSocPct) ? rollingSocPct : vehicleBase.currentSocPct,
     };
 
     const seg = segEnergyAndTime(d, slope, speed, segVehicle);
@@ -261,6 +335,9 @@ export function routeEnergyTimeSegmentWeather(
     totalH += seg.timeH;
     totalM += d;
     speedWeighted += speed * d;
+    if (Number.isFinite(rollingSocPct) && vehicleBase.batteryKwh > 0) {
+      rollingSocPct = clamp(rollingSocPct - (seg.energyWh / 1000 / vehicleBase.batteryKwh) * 100, 0, 100);
+    }
   }
   return {
     energyWh: totalWh,
@@ -287,6 +364,180 @@ export function wayTypeToSpeedLimit(wayType: number): number {
   return map[wayType] ?? 50;
 }
 
+export function wayTypeToMinSpeed(wayType: number): number {
+  const map: Record<number, number> = {
+    1: 80,
+    2: 80,
+    3: 60,
+  };
+  return map[wayType] ?? 0;
+}
+
+function buildSegmentSpeedBounds(
+  coordsLen: number,
+  waytypes: WayTypeRange[],
+  userSpeedLimit: number,
+): { limitSpeedPerSeg: number[]; minSpeedPerSeg: number[] } {
+  const segCount = Math.max(coordsLen - 1, 0);
+  const boundedUserLimit = Math.max(1, userSpeedLimit);
+  const limitSpeedPerSeg = new Array(segCount).fill(boundedUserLimit);
+  const minSpeedPerSeg = new Array(segCount).fill(0);
+  for (const w of waytypes) {
+    const lim = Math.min(wayTypeToSpeedLimit(w.wayType), boundedUserLimit);
+    const minSpeed = Math.min(lim, wayTypeToMinSpeed(w.wayType));
+    for (let i = Math.max(0, w.from); i <= Math.min(segCount - 1, w.to); i += 1) {
+      limitSpeedPerSeg[i] = lim;
+      minSpeedPerSeg[i] = Math.max(minSpeedPerSeg[i], minSpeed);
+    }
+  }
+  return { limitSpeedPerSeg, minSpeedPerSeg };
+}
+
+function applyIntersectionSpeedReduction(
+  speeds: number[],
+  minSpeedPerSeg: number[],
+  steps: RouteStep[],
+): number[] {
+  const adjusted = [...speeds];
+  for (const step of steps) {
+    const txt = (step.instruction ?? "").toLowerCase();
+    if (!(txt.includes("turn") || txt.includes("roundabout") || txt.includes("left") || txt.includes("right"))) continue;
+    if (!step.way_points) continue;
+    const idx = Math.max(0, Math.min(adjusted.length - 1, step.way_points[0]));
+    adjusted[idx] = Math.max(minSpeedPerSeg[idx] ?? 0, adjusted[idx] * 0.7);
+  }
+  return adjusted;
+}
+
+function projectArrivalSocPct(vehicle: VehicleParams, startSocPct: number, energyWh: number) {
+  if (vehicle.batteryKwh <= 0 || !Number.isFinite(startSocPct)) return Number.NaN;
+  return clamp(startSocPct - (energyWh / 1000 / vehicle.batteryKwh) * 100, 0, 100);
+}
+
+export function optimalSpeedForSegment(
+  distanceM: number,
+  slope: number,
+  limitKmh: number,
+  minSpeedKmh: number,
+  energyBudgetWh: number,
+  vehicle: VehicleParams,
+): number {
+  const upper = Math.max(1, limitKmh);
+  const lower = clamp(Math.max(minSpeedKmh, 1), 1, upper);
+  if (distanceM <= 0) return upper;
+
+  const toleranceWh = 0.5;
+  const minEnergyWh = segEnergyAndTime(distanceM, slope, lower, vehicle).energyWh;
+  if (minEnergyWh > energyBudgetWh + toleranceWh) return lower;
+
+  const limitEnergyWh = segEnergyAndTime(distanceM, slope, upper, vehicle).energyWh;
+  if (limitEnergyWh <= energyBudgetWh + toleranceWh) return upper;
+  if (limitEnergyWh < minEnergyWh) {
+    return limitEnergyWh <= energyBudgetWh + toleranceWh ? upper : lower;
+  }
+
+  let low = lower;
+  let high = upper;
+  let best = lower;
+  for (let iter = 0; iter < 20; iter += 1) {
+    const mid = (low + high) / 2;
+    const energyWh = segEnergyAndTime(distanceM, slope, mid, vehicle).energyWh;
+    if (Math.abs(energyWh - energyBudgetWh) <= toleranceWh) return mid;
+    if (energyWh <= energyBudgetWh) {
+      best = mid;
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  return clamp(best, lower, upper);
+}
+
+export function buildSegmentSpeedsOptimal(
+  coords: Coord[],
+  elevations: number[],
+  waytypes: WayTypeRange[],
+  vehicle: VehicleParams,
+  availableEnergyWh: number,
+  userSpeedLimitKmh: number,
+  steps: RouteStep[],
+): { speeds: number[]; projectedSocPct: number; feasible: boolean } {
+  const segCount = Math.max(coords.length - 1, 0);
+  const startSocPct = Number.isFinite(vehicle.currentSocPct) ? clamp(Number(vehicle.currentSocPct), 0, 100) : Number.NaN;
+  if (segCount === 0) {
+    return { speeds: [], projectedSocPct: startSocPct, feasible: true };
+  }
+
+  const { limitSpeedPerSeg, minSpeedPerSeg } = buildSegmentSpeedBounds(coords.length, waytypes, userSpeedLimitKmh);
+  const energyAtLimit = routeEnergyTime(coords, elevations, limitSpeedPerSeg, vehicle).energyWh;
+  const usableEnergyWh = Math.max(0, availableEnergyWh);
+
+  if (energyAtLimit <= usableEnergyWh + 0.5) {
+    const directSpeeds = applyIntersectionSpeedReduction(limitSpeedPerSeg, minSpeedPerSeg, steps);
+    const directProjection = routeEnergyTime(coords, elevations, directSpeeds, vehicle);
+    return {
+      speeds: directSpeeds,
+      projectedSocPct: projectArrivalSocPct(vehicle, startSocPct, directProjection.energyWh),
+      feasible: true,
+    };
+  }
+
+  const distancesM = new Array(segCount).fill(0);
+  const slopes = new Array(segCount).fill(0);
+  const limitEnergyPerSegWh = new Array(segCount).fill(0);
+  const minLegalEnergyPerSegWh = new Array(segCount).fill(0);
+  for (let i = 1; i < coords.length; i += 1) {
+    const [lon1, lat1] = coords[i - 1];
+    const [lon2, lat2] = coords[i];
+    const d = haversineM(lon1, lat1, lon2, lat2);
+    const e1 = elevations[i - 1] ?? 0;
+    const e2 = elevations[i] ?? e1;
+    const edgeIdx = i - 1;
+    const limit = limitSpeedPerSeg[edgeIdx] ?? Math.max(1, userSpeedLimitKmh);
+    const minSpeed = minSpeedPerSeg[edgeIdx] ?? 0;
+    distancesM[i - 1] = d;
+    slopes[i - 1] = d > 0 ? (e2 - e1) / d : 0;
+    limitEnergyPerSegWh[edgeIdx] = Math.max(0, segEnergyAndTime(d, slopes[i - 1], limit, vehicle).energyWh);
+    minLegalEnergyPerSegWh[edgeIdx] = segEnergyAndTime(d, slopes[i - 1], minSpeed, vehicle).energyWh;
+  }
+
+  const baseSpeeds = new Array(segCount).fill(0);
+  let rollingSocPct = startSocPct;
+  for (let edgeIdx = 0; edgeIdx < segCount; edgeIdx += 1) {
+    const distM = distancesM[edgeIdx] ?? 0;
+    const slope = slopes[edgeIdx] ?? 0;
+    const limit = limitSpeedPerSeg[edgeIdx] ?? Math.max(1, userSpeedLimitKmh);
+    const minSpeed = minSpeedPerSeg[edgeIdx] ?? 0;
+    const energyAtLimitSegWh = limitEnergyPerSegWh[edgeIdx] ?? 0;
+    const proportionalBudgetWh = energyAtLimit > 0 ? usableEnergyWh * (energyAtLimitSegWh / energyAtLimit) : usableEnergyWh / segCount;
+    const energyBudgetSegWh = Math.max(minLegalEnergyPerSegWh[edgeIdx] ?? 0, proportionalBudgetWh);
+    const speed = optimalSpeedForSegment(distM, slope, limit, 1, energyBudgetSegWh, {
+      ...vehicle,
+      currentSocPct: Number.isFinite(rollingSocPct) ? rollingSocPct : vehicle.currentSocPct,
+    });
+    const displayedSpeed = Math.max(minSpeed, speed);
+    baseSpeeds[edgeIdx] = displayedSpeed;
+
+    if (Number.isFinite(rollingSocPct) && vehicle.batteryKwh > 0 && distM > 0) {
+      const seg = segEnergyAndTime(distM, slope, displayedSpeed, {
+        ...vehicle,
+        currentSocPct: rollingSocPct,
+      });
+      rollingSocPct = clamp(rollingSocPct - (seg.energyWh / 1000 / vehicle.batteryKwh) * 100, 0, 100);
+    }
+  }
+
+  const speeds = applyIntersectionSpeedReduction(baseSpeeds, minSpeedPerSeg, steps);
+  const projected = routeEnergyTime(coords, elevations, speeds, vehicle);
+  const minLegalSpeeds = limitSpeedPerSeg.map((limit, index) => clamp(Math.max(minSpeedPerSeg[index] ?? 0, 1), 1, limit));
+  const minimumProjection = routeEnergyTime(coords, elevations, minLegalSpeeds, vehicle);
+  return {
+    speeds,
+    projectedSocPct: projectArrivalSocPct(vehicle, startSocPct, projected.energyWh),
+    feasible: minimumProjection.energyWh <= usableEnergyWh + 0.5,
+  };
+}
+
 export function buildSegmentSpeeds(
   coordsLen: number,
   waytypes: WayTypeRange[],
@@ -296,18 +547,23 @@ export function buildSegmentSpeeds(
   steps: RouteStep[],
 ): number[] {
   const perSeg = new Array(Math.max(coordsLen - 1, 0)).fill(candidateSpeed);
+  const minSpeedPerSeg = new Array(Math.max(coordsLen - 1, 0)).fill(0);
   for (const w of waytypes) {
     const lim = Math.min(wayTypeToSpeedLimit(w.wayType), userSpeedLimit);
-    const low = Math.max(20, lim - minDelta);
+    const minSpeed = Math.min(lim, wayTypeToMinSpeed(w.wayType));
+    const low = Math.max(minSpeed, lim - minDelta);
     const v = Math.max(low, Math.min(candidateSpeed, lim));
-    for (let i = Math.max(0, w.from); i <= Math.min(perSeg.length - 1, w.to); i += 1) perSeg[i] = v;
+    for (let i = Math.max(0, w.from); i <= Math.min(perSeg.length - 1, w.to); i += 1) {
+      perSeg[i] = v;
+      minSpeedPerSeg[i] = Math.max(minSpeedPerSeg[i], minSpeed);
+    }
   }
   for (const step of steps) {
     const txt = (step.instruction ?? "").toLowerCase();
     if (!(txt.includes("turn") || txt.includes("roundabout") || txt.includes("left") || txt.includes("right"))) continue;
     if (!step.way_points) continue;
     const idx = Math.max(0, Math.min(perSeg.length - 1, step.way_points[0]));
-    perSeg[idx] = Math.max(25, perSeg[idx] * 0.7);
+    perSeg[idx] = Math.max(minSpeedPerSeg[idx], Math.max(25, perSeg[idx] * 0.7));
   }
   return perSeg;
 }

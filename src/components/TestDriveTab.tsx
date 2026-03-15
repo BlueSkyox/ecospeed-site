@@ -98,7 +98,7 @@ export default function TestDriveTab() {
         battery_start_pct: batteryStart,
         battery_end_pct: batteryEnd,
         use_climate: true,
-        climate_intensity: 50,
+        hvac_mode: "comfort",
         comfort_temp_c: 21,
         vehicle_profile: {
           battery_kwh: 75,

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { saveTripSession } from "@/lib/trip-session-store";
+import { normalizeHvacMode, type HvacMode } from "@/lib/ev";
 
 type Body = {
   tripId: string;
@@ -11,6 +12,8 @@ type Body = {
   remainingCoords?: [number, number][];
   remainingEcoSpeedsKmh?: number[];
   comfortTempC?: number;
+  hvacMode?: HvacMode;
+  climateIntensityPct?: number;
   vehicleProfile?: {
     empty_mass?: number;
     extra_load?: number;
@@ -43,7 +46,7 @@ export async function POST(req: NextRequest) {
   }
   if (!body?.tripId) return NextResponse.json({ error: "Missing tripId" }, { status: 400 });
 
-  const session = saveTripSession({
+  const session = await saveTripSession({
     tripId: body.tripId,
     status: "paused",
     pausedAt: new Date().toISOString(),
@@ -57,6 +60,7 @@ export async function POST(req: NextRequest) {
       ? body.remainingEcoSpeedsKmh.map((v) => Number(v)).filter((v) => Number.isFinite(v))
       : [],
     comfortTempC: Number(body.comfortTempC ?? 20),
+    hvacMode: normalizeHvacMode(body.hvacMode, body.climateIntensityPct),
     vehicleProfile: body.vehicleProfile ?? {},
     distanceKm: Number(body.distanceKm ?? 0),
     logbook: Array.isArray(body.logbook) ? body.logbook : [],

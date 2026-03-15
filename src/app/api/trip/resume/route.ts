@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getTripHistory, getTripSession, markTripActive, saveTripSession } from "@/lib/trip-session-store";
-import { routeEnergyTimeSegmentWeather, type VehicleParams } from "@/lib/ev";
+import { HVAC_PRESETS, normalizeHvacMode, routeEnergyTimeSegmentWeather, type HvacMode, type VehicleParams } from "@/lib/ev";
 
 type Body = {
   tripId: string;
@@ -15,8 +15,11 @@ type Body = {
     remainingCoords?: [number, number][];
     remainingEcoSpeedsKmh?: number[];
     comfortTempC?: number;
+    hvacMode?: HvacMode;
+    climateIntensityPct?: number;
     vehicleProfile?: {
       empty_mass?: number;
+      extra_load?: number;
       drag_coefficient?: number;
       frontal_area?: number;
       rolling_resistance?: number;
@@ -76,9 +79,12 @@ async function pointWeather(lat: number, lon: number) {
   const providers = [
     async () => {
       const r = await withTimeout(
-        fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain`, {
-          cache: "no-store",
-        }),
+        fetch(
+          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,precipitation,rain,wind_speed_10m,wind_direction_10m`,
+          {
+            cache: "no-store",
+          },
+        ),
         7000,
       );
       if (!r.ok) throw new Error("weather failed");
@@ -87,6 +93,8 @@ async function pointWeather(lat: number, lon: number) {
       return {
         tempC: Number(cur.temperature_2m ?? 20),
         rainMmH: Number(cur.rain ?? cur.precipitation ?? 0),
+        windKmh: Math.max(0, Number(cur.wind_speed_10m ?? 0)),
+        windDirFromDeg: ((Number(cur.wind_direction_10m ?? 0) % 360) + 360) % 360,
       };
     },
     async () => {
@@ -107,6 +115,8 @@ async function pointWeather(lat: number, lon: number) {
       return {
         tempC: Number(instant.air_temperature ?? 20),
         rainMmH: Math.max(0, Number(nextHour.precipitation_amount ?? 0)),
+        windKmh: Math.max(0, Number(instant.wind_speed ?? 0) * 3.6),
+        windDirFromDeg: ((Number(instant.wind_from_direction ?? 0) % 360) + 360) % 360,
       };
     },
   ];
@@ -120,6 +130,24 @@ async function pointWeather(lat: number, lon: number) {
     }
   }
   throw lastError ?? new Error("weather failed");
+}
+
+function bearingRadFromNorth(lon1: number, lat1: number, lon2: number, lat2: number) {
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const p1 = (lat1 * Math.PI) / 180;
+  const p2 = (lat2 * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2) - Math.sin(p1) * Math.cos(p2) * Math.cos(dLon);
+  return Math.atan2(y, x);
+}
+
+function smoothElevations(elevations: number[]) {
+  if (elevations.length <= 2) return elevations;
+  return elevations.map((value, index) => {
+    const prev = elevations[index - 1] ?? value;
+    const next = elevations[index + 1] ?? value;
+    return (prev + value + next) / 3;
+  });
 }
 
 async function fetchElevationChunk(coords: [number, number][]) {
@@ -171,9 +199,18 @@ async function fetchElevations(coords: [number, number][]) {
 async function fetchRouteWeather(coords: [number, number][]) {
   if (coords.length < 2) {
     return {
-      samples: [] as Array<{ index: number; lat: number; lon: number; tempC: number; rainMmH: number }>,
+      samples: [] as Array<{
+        index: number;
+        lat: number;
+        lon: number;
+        tempC: number;
+        rainMmH: number;
+        windKmh: number;
+        windDirFromDeg: number;
+      }>,
       edgeTemp: [] as number[],
       edgeRain: [] as number[],
+      edgeHeadwindMs: [] as number[],
     };
   }
   const idx = pickSampleIndices(coords.length, Math.min(12, coords.length));
@@ -185,32 +222,73 @@ async function fetchRouteWeather(coords: [number, number][]) {
     }),
   );
   const samples = settled
-    .filter((res): res is PromiseFulfilledResult<{ index: number; lat: number; lon: number; tempC: number; rainMmH: number }> => res.status === "fulfilled")
+    .filter(
+      (
+        res,
+      ): res is PromiseFulfilledResult<{
+        index: number;
+        lat: number;
+        lon: number;
+        tempC: number;
+        rainMmH: number;
+        windKmh: number;
+        windDirFromDeg: number;
+      }> => res.status === "fulfilled",
+    )
     .map((res) => res.value);
   if (samples.length === 0) {
     return {
-      samples: [] as Array<{ index: number; lat: number; lon: number; tempC: number; rainMmH: number }>,
+      samples: [] as Array<{
+        index: number;
+        lat: number;
+        lon: number;
+        tempC: number;
+        rainMmH: number;
+        windKmh: number;
+        windDirFromDeg: number;
+      }>,
       edgeTemp: new Array(Math.max(0, coords.length - 1)).fill(20),
       edgeRain: new Array(Math.max(0, coords.length - 1)).fill(0),
+      edgeHeadwindMs: new Array(Math.max(0, coords.length - 1)).fill(0),
     };
   }
   const tempMap = new Map<number, number>();
   const rainMap = new Map<number, number>();
+  const windUxMap = new Map<number, number>();
+  const windUyMap = new Map<number, number>();
   for (const sample of samples) {
     tempMap.set(sample.index, sample.tempC);
     rainMap.set(sample.index, Math.max(0, sample.rainMmH));
+    const windToRad = (((sample.windDirFromDeg + 180) % 360) * Math.PI) / 180;
+    const windMs = sample.windKmh / 3.6;
+    windUxMap.set(sample.index, windMs * Math.sin(windToRad));
+    windUyMap.set(sample.index, windMs * Math.cos(windToRad));
   }
   const pointTemp = interpolateByIndex(tempMap, coords.length);
   const pointRain = interpolateByIndex(rainMap, coords.length);
+  const pointWindUx = interpolateByIndex(windUxMap, coords.length);
+  const pointWindUy = interpolateByIndex(windUyMap, coords.length);
   return {
     samples,
     edgeTemp: pointTemp.slice(1).map((v, i) => (v + pointTemp[i]) / 2),
     edgeRain: pointRain.slice(1).map((v, i) => Math.max(0, (v + pointRain[i]) / 2)),
+    edgeHeadwindMs: coords.slice(1).map((coord, index) => {
+      const [lon1, lat1] = coords[index];
+      const [lon2, lat2] = coord;
+      const bearing = bearingRadFromNorth(lon1, lat1, lon2, lat2);
+      const dirX = Math.sin(bearing);
+      const dirY = Math.cos(bearing);
+      const ux = (pointWindUx[index + 1] + pointWindUx[index]) / 2;
+      const uy = (pointWindUy[index + 1] + pointWindUy[index]) / 2;
+      const tailwindMs = ux * dirX + uy * dirY;
+      return -tailwindMs;
+    }),
   };
 }
 
 function profileToVehicleParams(profile: {
   empty_mass?: number;
+  extra_load?: number;
   drag_coefficient?: number;
   frontal_area?: number;
   rolling_resistance?: number;
@@ -223,7 +301,7 @@ function profileToVehicleParams(profile: {
   const frontalArea = Math.max(1, Number(profile.frontal_area ?? 2.2));
   const cda = rawDrag > 0.4 ? Math.max(0.2, rawDrag) : Math.max(0.2, rawDrag * frontalArea);
   return {
-    massKg: Math.max(800, Number(profile.empty_mass ?? 1850)),
+    massKg: Math.max(800, Number(profile.empty_mass ?? 1850)) + Math.max(0, Number(profile.extra_load ?? 0)),
     cda,
     crr: clamp(Number(profile.rolling_resistance ?? 0.01), 0.004, 0.02),
     rhoAir: 1.225,
@@ -244,11 +322,11 @@ export async function POST(req: NextRequest) {
   }
   if (!body?.tripId) return NextResponse.json({ error: "Missing tripId" }, { status: 400 });
 
-  const existingSession = getTripSession(body.tripId);
+  const existingSession = await getTripSession(body.tripId);
   const hydratedSession =
     existingSession ??
     (body.sessionSnapshot
-      ? saveTripSession({
+      ? await saveTripSession({
           tripId: body.sessionSnapshot.tripId,
           status: body.sessionSnapshot.status ?? "paused",
           pausedAt: new Date().toISOString(),
@@ -259,24 +337,33 @@ export async function POST(req: NextRequest) {
           remainingCoords: body.sessionSnapshot.remainingCoords,
           remainingEcoSpeedsKmh: body.sessionSnapshot.remainingEcoSpeedsKmh,
           comfortTempC: body.sessionSnapshot.comfortTempC,
+          hvacMode: normalizeHvacMode(body.sessionSnapshot.hvacMode, body.sessionSnapshot.climateIntensityPct),
           vehicleProfile: body.sessionSnapshot.vehicleProfile ?? {},
           distanceKm: Number(body.sessionSnapshot.route?.total_distance_km ?? 0),
         })
       : null);
   if (!hydratedSession) return NextResponse.json({ error: "Trip not found" }, { status: 404 });
 
-  const updated = markTripActive(body.tripId, body.batteryPctAfter);
+  const updated = await markTripActive(body.tripId, body.batteryPctAfter);
   if (!updated) return NextResponse.json({ error: "Resume failed" }, { status: 500 });
 
   try {
     const coords = updated.remainingCoords ?? [];
-    const history = getTripHistory(body.tripId);
+    const history = await getTripHistory(body.tripId);
     if (coords.length < 2) return NextResponse.json({ ok: true, session: updated, weatherRefresh: null, history });
     const weather = await fetchRouteWeather(coords);
     const edgeCount = coords.length - 1;
-    const elevations = await fetchElevations(coords);
+    const elevations = smoothElevations(await fetchElevations(coords));
     const profile = updated.vehicleProfile ?? {};
     const comfortTempC = Number(updated.comfortTempC ?? 20);
+    const legacyClimateIntensityPct = Number(body.sessionSnapshot?.climateIntensityPct ?? Number.NaN);
+    const hvacMode = normalizeHvacMode(updated.hvacMode, legacyClimateIntensityPct);
+    const climateEnabled =
+      updated.hvacMode !== undefined || body.sessionSnapshot?.hvacMode !== undefined
+        ? true
+        : Number.isFinite(legacyClimateIntensityPct)
+          ? legacyClimateIntensityPct > 0
+          : true;
     const vehicle = profileToVehicleParams(profile);
     const remainingEcoSpeeds = Array.isArray(updated.remainingEcoSpeedsKmh)
       ? updated.remainingEcoSpeedsKmh.map((v) => Number(v))
@@ -298,7 +385,13 @@ export async function POST(req: NextRequest) {
       vehicle,
       weather.edgeTemp,
       weather.edgeRain,
-      comfortTempC,
+      {
+        comfortC: comfortTempC,
+        climateEnabled,
+        climateBoostKw: climateEnabled ? HVAC_PRESETS[hvacMode] : 0,
+        segmentHeadwindMs: weather.edgeHeadwindMs,
+        startBatteryPct: Number(updated.batteryPctAfter ?? updated.batteryPctBefore ?? body.batteryPctAfter ?? 50),
+      },
     );
     const remainingEnergyKwh = recalculated.energyWh / 1000;
     const remainingTimeMin = recalculated.timeH * 60;
@@ -317,6 +410,6 @@ export async function POST(req: NextRequest) {
       history,
     });
   } catch {
-    return NextResponse.json({ ok: true, session: updated, weatherRefresh: null, history: getTripHistory(body.tripId) });
+    return NextResponse.json({ ok: true, session: updated, weatherRefresh: null, history: await getTripHistory(body.tripId) });
   }
 }

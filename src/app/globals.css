@@ -70,7 +70,7 @@ img {
 
 .ecospeed-hero {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
   gap: 24px;
   align-items: stretch;
   margin-bottom: 24px;
@@ -310,9 +310,9 @@ img {
   font-size: 0.82rem;
 }
 
-.ecospeed-field input,
+.ecospeed-field input:not([type="radio"]),
 .ecospeed-field select,
-.ecospeed-inline-field input,
+.ecospeed-inline-field input:not([type="radio"]),
 .ecospeed-inline-field select {
   width: 100%;
   min-height: 50px;
@@ -324,9 +324,9 @@ img {
   transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
 }
 
-.ecospeed-field input:focus,
+.ecospeed-field input:not([type="radio"]):focus,
 .ecospeed-field select:focus,
-.ecospeed-inline-field input:focus,
+.ecospeed-inline-field input:not([type="radio"]):focus,
 .ecospeed-inline-field select:focus {
   outline: none;
   border-color: rgba(47, 143, 91, 0.45);
@@ -336,6 +336,55 @@ img {
 
 .ecospeed-field--wide {
   grid-column: 1 / -1;
+}
+
+.ecospeed-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.ecospeed-choice-card {
+  display: grid;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.72);
+  cursor: pointer;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease, transform 0.18s ease;
+}
+
+.ecospeed-choice-card input[type="radio"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ecospeed-choice-card strong {
+  font-size: 0.96rem;
+}
+
+.ecospeed-choice-card span {
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.ecospeed-choice-card:hover {
+  transform: translateY(-1px);
+  border-color: rgba(47, 143, 91, 0.28);
+}
+
+.ecospeed-choice-card:focus-within {
+  border-color: rgba(47, 143, 91, 0.45);
+  box-shadow: 0 0 0 4px rgba(47, 143, 91, 0.12);
+}
+
+.ecospeed-choice-card.is-active {
+  border-color: rgba(29, 111, 69, 0.5);
+  background: linear-gradient(180deg, rgba(223, 243, 228, 0.95), rgba(255, 255, 255, 0.92));
+  box-shadow: 0 10px 22px rgba(47, 143, 91, 0.12);
 }
 
 .ecospeed-panel h2 {
@@ -353,6 +402,22 @@ img {
   margin: 12px 0 0;
   color: var(--muted);
   line-height: 1.55;
+}
+
+.ecospeed-profile-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.ecospeed-profile-facts span {
+  padding: 8px 11px;
+  border-radius: 999px;
+  background: rgba(47, 143, 91, 0.08);
+  color: var(--accent-strong);
+  font-size: 0.82rem;
+  font-weight: 800;
 }
 
 .ecospeed-actions,
@@ -895,6 +960,10 @@ img {
   background: #2d74c4;
 }
 
+.ecospeed-chart-swatch--wind {
+  background: #2f8f5b;
+}
+
 .ecospeed-inline-grid--trip {
   margin-top: 18px;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -988,6 +1057,10 @@ img {
   .ecospeed-shell {
     width: min(100vw - 20px, 100%);
     padding: 18px 0 42px;
+  }
+
+  .ecospeed-choice-grid {
+    grid-template-columns: 1fr;
   }
 
   .ecospeed-hero__topbar {

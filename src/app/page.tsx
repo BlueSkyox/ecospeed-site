@@ -10,51 +10,65 @@ const LOCALE_KEY = "ecospeed_locale_v1";
 const copy = {
   fr: {
     eyebrow: "EcoSpeed / planificateur VE",
-    title: "Des trajets electriques clairs, utiles et faciles a suivre.",
+    title: "Le copilote VE qui rend chaque trajet plus clair, plus fiable et plus simple a suivre.",
     intro:
-      "Calculez une vitesse eco realiste, comprenez vos gains tout de suite et gardez une lecture simple du trajet avant et pendant la route.",
+      "EcoSpeed transforme un calcul technique en decisions lisibles: vitesse eco credible, batterie resolue en kWh, impact meteo reconstitue sur le trajet et pauses de recharge vraiment utiles.",
     proofPoints: [
-      "Economies d energie et de CO2 faciles a lire",
-      "Segments avec vitesse optimale sur chaque portion",
-      "Plan de charge et carte dans une seule vue",
+      "Batterie traduite en kWh reel selon le vehicule choisi",
+      "Vent, temperature et denivele pris en compte sur le parcours",
+      "Plan de charge, carte et lecture conduite dans une seule interface",
+    ],
+    panelKicker: "Pourquoi c est plus fiable",
+    panelTitle: "Une lecture claire, sans masquer la physique du trajet.",
+    panelPoints: [
+      "La recommandation de vitesse suit le profil altimetrique du parcours, pas une moyenne abstraite.",
+      "Le vent et la temperature sont recuperes sur la route pour rendre la conso HVAC et aero plus credibles.",
+      "Les gains sont traduits en kWh, euros, autonomie recuperee et temps de recharge equivalent.",
     ],
     pillars: [
       {
-        title: "Lecture immediate",
-        text: "Les chiffres importants sont traduits en gains concrets: energie, argent, autonomie et CO2.",
+        title: "Comprendre en 10 secondes",
+        text: "Les chiffres importants sont reformules en decisions: quelle vitesse viser, combien vous gagnez et quand recharger.",
       },
       {
-        title: "Aide a la conduite",
-        text: "Les informations critiques restent grosses, directes et faciles a retrouver sans surcharge visuelle.",
+        title: "Faire confiance au calcul",
+        text: "La batterie, la masse, la meteo et le relief sont relies au modele pour eviter les raccourcis trompeurs.",
       },
       {
-        title: "Suivi motivant",
-        text: "Les badges et l historique encouragent l utilisateur a revenir et a mesurer ses progres.",
+        title: "Rester serein sur la route",
+        text: "La vue conduite, l historique local et les badges gardent l experience utile avant, pendant et apres le trajet.",
       },
     ],
   },
   en: {
     eyebrow: "EcoSpeed / EV trip planner",
-    title: "Clear electric trips that are easy to understand and easy to follow.",
+    title: "The EV co-pilot that makes every trip clearer, more reliable and easier to follow.",
     intro:
-      "Calculate a realistic eco speed, understand your savings instantly, and keep a simple trip view before and during the drive.",
+      "EcoSpeed turns a technical simulation into readable decisions: credible eco speed, battery resolved in kWh, route-based weather impact and charging stops that are actually useful.",
     proofPoints: [
-      "Energy and CO2 savings explained clearly",
-      "Segment-by-segment optimal speed guidance",
-      "Charging plan and map in one place",
+      "Battery translated into real kWh for the selected vehicle",
+      "Wind, temperature and elevation included along the route",
+      "Charging plan, map and drive view in one interface",
+    ],
+    panelKicker: "Why it feels more trustworthy",
+    panelTitle: "A clearer view, without hiding the trip physics.",
+    panelPoints: [
+      "The recommended speed follows the elevation profile instead of relying on an abstract average.",
+      "Wind and temperature are sampled along the route so HVAC and aero consumption stay believable.",
+      "Savings are translated into kWh, money, recovered range and equivalent charging time.",
     ],
     pillars: [
       {
-        title: "Instant reading",
-        text: "The key numbers are translated into concrete gains: energy, money, range and CO2.",
+        title: "Understand it in 10 seconds",
+        text: "The key numbers are phrased as decisions: what speed to target, how much you save and when to charge.",
       },
       {
-        title: "Driving support",
-        text: "Critical information stays large, direct and easy to find without visual overload.",
+        title: "Trust the calculation",
+        text: "Battery, mass, weather and elevation stay connected to the model instead of being treated as rough guesses.",
       },
       {
-        title: "Motivating follow-up",
-        text: "Badges and trip history encourage users to come back and track their progress.",
+        title: "Stay calm on the road",
+        text: "The drive view, local history and badges keep the experience useful before, during and after the trip.",
       },
     ],
   },
@@ -111,6 +125,15 @@ export default function Home() {
             ))}
           </div>
         </div>
+        <aside className="ecospeed-hero__panel">
+          <span className="ecospeed-kicker">{t.panelKicker}</span>
+          <h2>{t.panelTitle}</h2>
+          <ul className="ecospeed-checklist">
+            {t.panelPoints.map((item) => (
+              <li key={item}>{item}</li>
+            ))}
+          </ul>
+        </aside>
       </section>
 
       <section className="ecospeed-pillars">
