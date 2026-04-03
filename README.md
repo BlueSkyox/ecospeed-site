@@ -63,6 +63,11 @@ npm run build
 5. Ajouter les variables d'environnement dans `Project Settings > Environment Variables`.
 6. Lancer le deploiement.
 
+## Publication simple via GitHub Pages
+
+- Le projet peut aussi etre publie sans Vercel via GitHub Pages.
+- La version GitHub Pages utilise un routage `HashRouter` pour que les pages React fonctionnent correctement en statique.
+
 ### Variables d'environnement Vercel
 
 Variable requise:

@@ -1,0 +1,32 @@
+<svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22c55e" />
+      <stop offset="1" stop-color="#16a34a" />
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="#022c22" />
+  <rect x="32" y="32" width="192" height="192" rx="48" fill="url(#bg)" />
+
+  <!-- Route courbe -->
+  <path
+    d="M56 196C88 188 104 172 120 144C136 116 160 96 200 88"
+    stroke="#bbf7d0"
+    stroke-width="10"
+    stroke-linecap="round"
+  />
+
+  <!-- Point de départ -->
+  <circle cx="64" cy="188" r="12" fill="#ecfdf5" stroke="#052e16" stroke-width="4" />
+
+  <!-- Point d'arrivée -->
+  <circle cx="196" cy="92" r="12" fill="#ecfdf5" stroke="#052e16" stroke-width="4" />
+
+  <!-- Foudre / vitesse éco -->
+  <path
+    d="M120 64L92 136H120L104 192L152 112H124L140 64H120Z"
+    fill="#022c22"
+  />
+</svg>
+
+
