@@ -1,6 +1,6 @@
 # EcoSpeed
 
-Application Next.js pour estimer un trajet en VE avec:
+Application React + Vite pour estimer un trajet en VE avec:
 
 - optimisation de vitesse basee sur un modele physique
 - estimation d'energie, temps de conduite et recharges
@@ -41,7 +41,7 @@ npm run dev
 5. Ouvrir:
 
 ```text
-http://localhost:3000
+http://localhost:5173
 ```
 
 ## Verification avant mise en ligne
@@ -59,7 +59,7 @@ npm run build
 1. Pousser le projet sur GitHub.
 2. Aller sur Vercel et cliquer sur `Add New... > Project`.
 3. Importer le repo GitHub.
-4. Laisser Vercel detecter automatiquement `Next.js`.
+4. Laisser Vercel detecter `Vite`, ou verifier dans `Settings > Build and Output Settings` que le framework est `Vite`.
 5. Ajouter les variables d'environnement dans `Project Settings > Environment Variables`.
 6. Lancer le deploiement.
 
@@ -108,6 +108,5 @@ vercel --prod
 ```bash
 npm run dev
 npm run build
-npm start
 npm run lint
 ```
